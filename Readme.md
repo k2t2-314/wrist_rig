@@ -1,3 +1,16 @@
+## Overview
+
+A real-time experimental control GUI for a wrist rehabilitation rig, developed at CMU's NeuroMechatronics Lab. The system controls a wrist exoskeleton to assist spinal cord injury (SCI) patients in rehabilitation exercises, with synchronized data acquisition and subject-facing display.
+
+**Key features:**
+- Multi-mode experiment control (ROM, AAN, passive/active movement, ramp-and-hold)
+- 100 Hz closed-loop motor control via serial communication
+- Real-time biosignal recording and UDP marker broadcasting
+- Subject-facing display with live force feedback
+
+**Hardware-dependent:** requires the physical wrist rig and serial-connected exoskeleton to run. Mock mode (`--mock`) available for UI testing without hardware.
+
+
 ## Project Structure
 
 ```
