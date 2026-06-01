@@ -1,8 +1,7 @@
 import socket
 import threading
+import time
 from datetime import datetime
-
-from pylsl import local_clock
 
 
 class UDPManager:
@@ -53,7 +52,7 @@ class UDPManager:
         except Exception:
             pass
         try:
-            t_rel = local_clock() - get_t0()
+            t_rel = time.perf_counter() - get_t0()
             t_abs = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
             self._last_send_t[key] = t_rel
             with open(log_path, "a", encoding="utf-8") as f:
@@ -117,7 +116,7 @@ class UDPManager:
             try:
                 data, addr = self._recv_sock.recvfrom(256)
                 print(f"[UDP] received from {addr}: {data!r}")
-                t_rel = local_clock() - get_t0()
+                t_rel = time.perf_counter() - get_t0()
                 t_abs = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
                 msg   = data.decode("utf-8", errors="ignore").strip()
                 rtt   = ""

@@ -2,7 +2,6 @@ import threading
 import time
 
 import serial
-from pylsl import local_clock
 
 from hardware.ring_buffer import InterpRingBuffer
 from config import SERIAL_BAUD, SERIAL_TIMEOUT
@@ -15,7 +14,7 @@ class SerialWorker:
 
     Usage:
         worker = SerialWorker()
-        worker.connect("COM7", on_success=..., on_error=...)
+        worker.connect("COM3", on_success=..., on_error=...)
         worker.send("SET_ANG:30.0")
         worker.disconnect()
     """
@@ -64,7 +63,7 @@ class SerialWorker:
                 continue
             parsed = self._parse(raw)
             if parsed is not None:
-                self.ring.append(local_clock(), parsed)
+                self.ring.append(time.perf_counter(), parsed)
 
     @staticmethod
     def _parse(line: str):

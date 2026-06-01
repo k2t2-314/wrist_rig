@@ -57,7 +57,7 @@ class AANMode(ModeBase):
         {"name": "pre_passive_pause_s", "default":  0.0, "min": 0.0, "max": 10.0,            "unit": "s (0=skip)"},
         {"name": "damper_pwm",          "default": 0,    "min": 0,   "max": 255,             "unit": "PWM (active/passive)"},
         {"name": "hold_time_s",         "default": 3.0,  "min": 0.5, "max": 30.0,            "unit": "s"},
-        {"name": "return_time_s",       "default": 3.0,  "min": 0.5, "max": 30.0,            "unit": "s (user return window)"},
+        {"name": "return_time_s",       "default": 3.0,  "min": 0.0, "max": 30.0,            "unit": "s (user return window, 0=skip)"},
         {"name": "rest_time_s",         "default": 3.0,  "min": 0.5, "max": 30.0,            "unit": "s"},
         {"name": "total_reps",          "default": 1,    "min": 1,   "max": 50,              "unit": "reps"},
         {"name": "damper_on_return",    "default": 1,    "min": 0,   "max": 1,               "unit": "0=off, 1=on"},
@@ -135,7 +135,11 @@ class AANMode(ModeBase):
             if self._hold_t >= hold_dur:
                 self._hold_t   = 0.0
                 self._return_t = 0.0
-                self._notify("hold", "return")
+                if return_dur <= 0.0:
+                    self._drive_pos = wrist
+                    self._notify("hold", "servo_back")
+                else:
+                    self._notify("hold", "return")
             return Command(servo=target_signed, damper=damper)
 
         # ── return: torque off, damper on, user has a s to return ─────────────

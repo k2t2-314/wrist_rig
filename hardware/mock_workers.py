@@ -14,8 +14,6 @@ import math
 import threading
 import time
 
-from pylsl import local_clock
-
 from hardware.ring_buffer import InterpRingBuffer
 
 
@@ -65,7 +63,7 @@ class MockSerialWorker:
                 wrist_motor,
                 0,           # dec_count
             ]
-            self.ring.append(local_clock(), sample)
+            self.ring.append(time.perf_counter(), sample)
             time.sleep(0.01)
 
     def send(self, cmd: str):
@@ -122,7 +120,7 @@ class MockLCWorker:
                 0.2 * math.sin(0.9 * t + 1.5)   - self._offset[4],
                 0.4 * math.sin(1.2 * t + 3.0)   - self._offset[5],
             ]
-            self.ring.append(local_clock(), sample)
+            self.ring.append(time.perf_counter(), sample)
             time.sleep(0.01)
 
     def connect(self, port: str = None, on_success=None, on_error=None):
@@ -130,7 +128,7 @@ class MockLCWorker:
             on_success()
 
     def retare(self):
-        samples = [s for _, s in self.ring.get_since(local_clock() - 0.5)]
+        samples = [s for _, s in self.ring.get_since(time.perf_counter() - 0.5)]
         if not samples:
             return
         n = len(samples)

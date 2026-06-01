@@ -6,7 +6,6 @@ Entry point:
     python run.py --mock    # synthetic data, no hardware needed
 """
 
-from cmath import phase
 import ctypes
 import sys
 from config import WRIST_LIMIT_DEG
@@ -30,16 +29,16 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-from pylsl import local_clock
-
 from config import (
     GEAR_RATIO, DATA_ROOT,
-    SERIAL_COM_PORT, LC_COM_PORT,
+    SERIAL_COM_PORT, LC_COM_PORT, TRIGGER_COM_PORT,
+    OBS_HOST, OBS_PORT, OBS_PASSWORD,
+    GOPRO_BASE_URL,
     UDP_HOST, UDP_SEND_PORT, UDP_LISTEN_PORT,
 )
 from motions import (
     RestMode, CalibrationMode, ROMMode, AANMode,
-    PassiveMovementMode, ActiveMovementMode,
+    PassiveMovementMode, ActiveMovementMode, FollowMode,
     RAHMode, MotionRunner,
 )
 from recording.recorder import BaseCsvRecorder
@@ -58,13 +57,25 @@ class ExpGUI(tk.Tk):
         # Hardware
         if use_mock:
             from hardware.mock_workers import MockSerialWorker, MockLCWorker
+            from hardware.trigger_worker import TriggerWorker
+            from hardware.obs_worker import OBSWorker
+            from hardware.gopro_worker import GoProWorker
             self.serial_worker = MockSerialWorker()
             self.lc_worker     = MockLCWorker()
+            self.trigger_worker = TriggerWorker()
+            self.obs_worker = OBSWorker()
+            self.gopro_worker = GoProWorker()
         else:
             from hardware.serial_worker import SerialWorker
             from hardware.lc_worker     import LCWorker
+            from hardware.trigger_worker import TriggerWorker
+            from hardware.obs_worker import OBSWorker
+            from hardware.gopro_worker import GoProWorker
             self.serial_worker = SerialWorker()
             self.lc_worker     = LCWorker()
+            self.trigger_worker = TriggerWorker()
+            self.obs_worker = OBSWorker()
+            self.gopro_worker = GoProWorker()
 
         self.wrist_zero = 0.0
         self.imu_zero   = 0.0
@@ -88,9 +99,17 @@ class ExpGUI(tk.Tk):
         self.direction_var   = tk.StringVar(value="1")
         self.port_var        = tk.StringVar(value=SERIAL_COM_PORT)
         self.lc_port_var     = tk.StringVar(value=LC_COM_PORT)
+        self.trigger_port_var = tk.StringVar(value=TRIGGER_COM_PORT)
+        self.obs_host_var     = tk.StringVar(value=OBS_HOST)
+        self.obs_port_var     = tk.StringVar(value=str(OBS_PORT))
+        self.obs_password_var = tk.StringVar(value=OBS_PASSWORD)
+        self.gopro_base_var   = tk.StringVar(value=GOPRO_BASE_URL)
         self.trial_var       = tk.StringVar(value="1")
         self.serial_status   = tk.StringVar(value="Serial: Disconnected")
         self.lc_status_var   = tk.StringVar(value="LC: Disconnected")
+        self.trigger_status_var = tk.StringVar(value="Trigger: Disconnected")
+        self.obs_status_var     = tk.StringVar(value="OBS: Disconnected")
+        self.gopro_status_var   = tk.StringVar(value="GoPro: Disconnected")
         self.angle_var       = tk.StringVar(value="--- deg")
         self.imu_var         = tk.StringVar(value="--- deg")
         self.current_var     = tk.StringVar(value="--- mA")
@@ -100,10 +119,10 @@ class ExpGUI(tk.Tk):
         self.fx_live_var     = tk.StringVar(value="--- ")
         self.lc_channel_var  = tk.StringVar(value="Fnorm")
         self._fx_history     = collections.deque(maxlen=300)
-
         self.udp_host_var   = tk.StringVar(value=UDP_HOST)
         self.udp_port_var   = tk.StringVar(value=str(UDP_SEND_PORT))
         self.udp_listen_var = tk.StringVar(value=str(UDP_LISTEN_PORT))
+
 
         # Rest
         self.rest_angle_var  = tk.StringVar(value="0.0")
@@ -145,6 +164,7 @@ class ExpGUI(tk.Tk):
         self.aan_return_timeout_var = tk.StringVar(value="5.0")
         self.aan_return_time_var   = tk.StringVar(value="3.0")
         self.aan_damper_return_var = tk.IntVar(value=1)
+        self.aan_display_guides_var = tk.IntVar(value=0)
 
         # Passive Movement
         self.pm_target_var    = tk.StringVar(value="40.0")
@@ -164,6 +184,15 @@ class ExpGUI(tk.Tk):
         self.am_damper_var    = tk.IntVar(value=0)
         self.am_phase_var     = tk.StringVar(value="—")
 
+        # Follow
+        self.follow_target_var = tk.StringVar(value="30.0")
+        self.follow_speed_var  = tk.StringVar(value="20.0")
+        self.follow_hold_var   = tk.StringVar(value="2.0")
+        self.follow_rest_var   = tk.StringVar(value="2.0")
+        self.follow_reps_var   = tk.StringVar(value="1")
+        self.follow_damper_var = tk.IntVar(value=0)
+        self.follow_phase_var  = tk.StringVar(value="—")
+
         # # Back and Forth
         # self.bf_left_var   = tk.StringVar(value="-30.0")
         # self.bf_right_var  = tk.StringVar(value="30.0")
@@ -180,11 +209,17 @@ class ExpGUI(tk.Tk):
 
         # Internal state
         self._csv_path              = ""
+        self._log_path              = ""
         self._udp_log_path          = ""
+        self._obs_trial_suffix      = ""
         self._motion_polling        = False
         self._cal_hold_marker_sent  = False
         self._cal_return_start_ts   = None
         self._cal_return_stop_ts    = None
+        self._am_active_segments    = []
+        self._am_return_segments    = []
+        self._am_go_start_ts        = None
+        self._am_return_start_ts    = None
 
         self._build_ui()
         self._serial_poll()
@@ -226,22 +261,56 @@ class ExpGUI(tk.Tk):
         ttk.Radiobutton(hand_frm, text="Left  (+wrist = flex)",
                         variable=self.handedness_var, value="Left").pack(side="left", padx=8, pady=4)
 
-        # UDP
-        frm = ttk.LabelFrame(left, text="UDP Marker Broadcast")
+        frm = ttk.LabelFrame(left, text="Marker Outputs")
         frm.pack(fill="x", **pad)
         frm.columnconfigure(1, weight=1)
-        ttk.Label(frm, text="Host:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(frm, text="UDP Host:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
         ttk.Entry(frm, textvariable=self.udp_host_var, width=14).grid(row=0, column=1, sticky="w", padx=4)
-        ttk.Label(frm, text="Port:").grid(row=0, column=2, sticky="w", padx=(12, 2))
+        ttk.Label(frm, text="UDP Port:").grid(row=0, column=2, sticky="w", padx=(12, 2))
         ttk.Entry(frm, textvariable=self.udp_port_var, width=8).grid(row=0, column=3, sticky="w", padx=4)
         ttk.Label(frm, text="Listen Port:").grid(row=1, column=0, sticky="w", padx=6, pady=(0, 4))
         ttk.Entry(frm, textvariable=self.udp_listen_var, width=8).grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Label(frm, text="Trigger Port:").grid(row=1, column=2, sticky="w", padx=(12, 2))
+        ttk.Entry(frm, textvariable=self.trigger_port_var, width=8).grid(row=1, column=3, sticky="w", padx=4)
+        ttk.Label(frm, text="OBS Host:").grid(row=2, column=0, sticky="w", padx=6, pady=(0, 4))
+        ttk.Entry(frm, textvariable=self.obs_host_var, width=14).grid(row=2, column=1, sticky="w", padx=4)
+        ttk.Label(frm, text="OBS Port:").grid(row=2, column=2, sticky="w", padx=(12, 2))
+        ttk.Entry(frm, textvariable=self.obs_port_var, width=8).grid(row=2, column=3, sticky="w", padx=4)
+        ttk.Label(frm, text="OBS Password:").grid(row=3, column=0, sticky="w", padx=6, pady=(0, 4))
+        ttk.Entry(frm, textvariable=self.obs_password_var, width=14, show="*").grid(
+            row=3, column=1, sticky="w", padx=4
+        )
+        ttk.Label(frm, text="GoPro Base:").grid(row=4, column=0, sticky="w", padx=6, pady=(0, 4))
+        ttk.Entry(frm, textvariable=self.gopro_base_var, width=28).grid(
+            row=4, column=1, columnspan=2, sticky="we", padx=4
+        )
+        gopro_btns = ttk.Frame(frm)
+        gopro_btns.grid(row=4, column=3, sticky="e", padx=4, pady=(0, 4))
+        self.btn_gopro_connect = ttk.Button(
+            gopro_btns, text="Connect", command=self.on_gopro_connect, width=8
+        )
+        self.btn_gopro_connect.pack(side="left", padx=(0, 4))
+        self.btn_gopro_disconnect = ttk.Button(
+            gopro_btns,
+            text="Disconnect",
+            command=self.on_gopro_disconnect,
+            state="disabled",
+            width=10,
+        )
+        self.btn_gopro_disconnect.pack(side="left")
+        ttk.Label(frm, textvariable=self.gopro_status_var,
+                  foreground="gray", font=("Segoe UI", 8)).grid(
+            row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 3))
+
+
 
         # Serial + LC
         conn_row = ttk.Frame(left)
         conn_row.pack(fill="x", padx=8, pady=(2, 2))
         conn_row.columnconfigure(0, weight=1)
         conn_row.columnconfigure(1, weight=1)
+        conn_row.columnconfigure(2, weight=1)
+        conn_row.columnconfigure(3, weight=1)
         ser_frm = ttk.LabelFrame(conn_row, text="Serial (Exo)")
         ser_frm.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
         ser_frm.columnconfigure(1, weight=1)
@@ -269,6 +338,38 @@ class ExpGUI(tk.Tk):
                                             state="disabled", width=9)
         self.btn_lc_disconnect.grid(row=0, column=3, padx=3)
         ttk.Label(lc_frm, textvariable=self.lc_status_var,
+                  foreground="gray", font=("Segoe UI", 8)).grid(
+            row=1, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 3))
+        trig_frm = ttk.LabelFrame(conn_row, text="Trigger Arduino")
+        trig_frm.grid(row=0, column=2, sticky="nsew", padx=(3, 0))
+        trig_frm.columnconfigure(1, weight=1)
+        ttk.Label(trig_frm, text="Port:").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        ttk.Entry(trig_frm, textvariable=self.trigger_port_var, width=7).grid(row=0, column=1, sticky="w", padx=3)
+        self.btn_trigger_connect = ttk.Button(trig_frm, text="Connect",
+                                              command=self.on_trigger_connect, width=8)
+        self.btn_trigger_connect.grid(row=0, column=2, padx=3)
+        self.btn_trigger_disconnect = ttk.Button(
+            trig_frm, text="Disconnect", command=self.on_trigger_disconnect,
+            state="disabled", width=9
+        )
+        self.btn_trigger_disconnect.grid(row=0, column=3, padx=3)
+        ttk.Label(trig_frm, textvariable=self.trigger_status_var,
+                  foreground="gray", font=("Segoe UI", 8)).grid(
+            row=1, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 3))
+        obs_frm = ttk.LabelFrame(conn_row, text="OBS")
+        obs_frm.grid(row=0, column=3, sticky="nsew", padx=(3, 0))
+        obs_frm.columnconfigure(1, weight=1)
+        ttk.Label(obs_frm, text="WS:").grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(obs_frm, textvariable=self.obs_port_var, width=6).grid(row=0, column=1, sticky="w", padx=3)
+        self.btn_obs_connect = ttk.Button(obs_frm, text="Connect",
+                                          command=self.on_obs_connect, width=8)
+        self.btn_obs_connect.grid(row=0, column=2, padx=3)
+        self.btn_obs_disconnect = ttk.Button(
+            obs_frm, text="Disconnect", command=self.on_obs_disconnect,
+            state="disabled", width=9
+        )
+        self.btn_obs_disconnect.grid(row=0, column=3, padx=3)
+        ttk.Label(obs_frm, textvariable=self.obs_status_var,
                   foreground="gray", font=("Segoe UI", 8)).grid(
             row=1, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 3))
 
@@ -314,8 +415,6 @@ class ExpGUI(tk.Tk):
                    command=self.on_zero, width=12).pack(side="left")
         ttk.Button(mode_row, text="Sync IMU",
            command=self.on_sync_imu, width=12).pack(side="left", padx=(6, 0))
-        ttk.Button(mode_row, text="Zero LC",
-                command=self.on_zero_lc, width=10).pack(side="left", padx=(6, 0))
 
         # Tabs
         self.notebook = ttk.Notebook(left)
@@ -327,6 +426,7 @@ class ExpGUI(tk.Tk):
         tab_pm   = ttk.Frame(self.notebook)
         # tab_bf   = ttk.Frame(self.notebook)
         tab_am   = ttk.Frame(self.notebook)
+        tab_follow = ttk.Frame(self.notebook)
         tab_rah  = ttk.Frame(self.notebook)
         self.notebook.add(tab_rest, text="  Rest  ")
         self.notebook.add(tab_cal,  text="  Calibration  ")
@@ -334,6 +434,7 @@ class ExpGUI(tk.Tk):
         self.notebook.add(tab_pm,   text="  Passive Movement  ")
         # self.notebook.add(tab_bf,   text="  Back and Forth  ")
         self.notebook.add(tab_am,   text="  Active Movement  ")
+        self.notebook.add(tab_follow, text="  Follow  ")
         self.notebook.add(tab_real, text="  AAN  ")
         self.notebook.add(tab_rah,  text="  Ramp & Hold  ")
         self._build_rest_tab(tab_rest)
@@ -342,6 +443,7 @@ class ExpGUI(tk.Tk):
         self._build_pm_tab(tab_pm)
         # self._build_bf_tab(tab_bf)
         self._build_am_tab(tab_am)
+        self._build_follow_tab(tab_follow)
         self._build_aan_tab(tab_real)
         self._build_rah_tab(tab_rah)
 
@@ -530,14 +632,6 @@ class ExpGUI(tk.Tk):
             self._rom_single_frm.pack_forget()
             self._rom_loop_frm.pack(fill="x", padx=6, pady=4)
 
-    def _rom_mode_switch(self):
-        if self.rom_mode_var.get() == "single":
-            self._rom_loop_frm.pack_forget()
-            self._rom_single_frm.pack(fill="x", padx=6, pady=4)
-        else:
-            self._rom_single_frm.pack_forget()
-            self._rom_loop_frm.pack(fill="x", padx=6, pady=4)
-
     def _build_aan_tab(self, parent):
         pad = {"padx": 6, "pady": 4}
 
@@ -578,6 +672,11 @@ class ExpGUI(tk.Tk):
         damp_ret_row.grid(row=2, column=0, columnspan=4, sticky="w", padx=6, pady=(2,6))
         ttk.Checkbutton(damp_ret_row, text="Damper ON during return (default: on)",
                         variable=self.aan_damper_return_var).pack(side="left")
+        ttk.Checkbutton(
+            damp_ret_row,
+            text="Show A/P guide lines on subject display",
+            variable=self.aan_display_guides_var,
+        ).pack(side="left", padx=(16, 0))
 
         # Control
         frm3 = ttk.LabelFrame(parent, text="Experiment Control")
@@ -729,21 +828,66 @@ class ExpGUI(tk.Tk):
         ttk.Label(frm2, textvariable=self.am_phase_var,
                   font=("Segoe UI", 8), foreground="gray").pack(anchor="w", padx=10, pady=(2, 6))
 
+    def _build_follow_tab(self, parent):
+        pad = {"padx": 6, "pady": 4}
+        frm = ttk.LabelFrame(parent, text="Parameters")
+        frm.pack(fill="x", **pad)
+        frm.columnconfigure(1, weight=1)
+        frm.columnconfigure(3, weight=1)
+        ttk.Label(frm, text="Target (deg):").grid(row=0, column=0, sticky="w", padx=6, pady=5)
+        ttk.Entry(frm, textvariable=self.follow_target_var, width=8).grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(frm, text="Guide speed (deg/s):").grid(row=0, column=2, sticky="w", padx=(16, 6), pady=5)
+        ttk.Entry(frm, textvariable=self.follow_speed_var, width=8).grid(row=0, column=3, sticky="w", padx=4)
+        ttk.Label(frm, text="Hold time at end (s):").grid(row=1, column=0, sticky="w", padx=6, pady=5)
+        ttk.Entry(frm, textvariable=self.follow_hold_var, width=8).grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Label(frm, text="Rest time at 0° (s):").grid(row=1, column=2, sticky="w", padx=(16, 6), pady=5)
+        ttk.Entry(frm, textvariable=self.follow_rest_var, width=8).grid(row=1, column=3, sticky="w", padx=4)
+        ttk.Label(frm, text="Reps (1 = single):").grid(row=2, column=0, sticky="w", padx=6, pady=5)
+        ttk.Entry(frm, textvariable=self.follow_reps_var, width=8).grid(row=2, column=1, sticky="w", padx=4)
+        ttk.Label(frm, text="Damper PWM:").grid(row=2, column=2, sticky="w", padx=(16, 6), pady=5)
+        ttk.Scale(frm, from_=0, to=255, orient="horizontal",
+                  variable=self.follow_damper_var, length=120).grid(row=2, column=3, sticky="w", padx=4)
+        ttk.Label(
+            frm,
+            text="Direction comes from the main Extension/Flexion selection. Markers follow the yellow guide ball.",
+            foreground="gray",
+            font=("Segoe UI", 8),
+        ).grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(2, 6))
+
+        frm2 = ttk.LabelFrame(parent, text="Experiment Control")
+        frm2.pack(fill="x", **pad)
+        r1 = ttk.Frame(frm2)
+        r1.pack(fill="x", padx=6, pady=(6, 2))
+        self.follow_btn_start = ttk.Button(r1, text="▶  Start", command=self.follow_on_start, width=14)
+        self.follow_btn_start.pack(side="left", padx=(0, 6))
+        self.follow_btn_stop = ttk.Button(r1, text="■  Stop", command=self.follow_on_stop,
+                                          state="disabled", width=14)
+        self.follow_btn_stop.pack(side="left")
+        ttk.Label(frm2, textvariable=self.follow_phase_var,
+                  font=("Segoe UI", 8), foreground="gray").pack(anchor="w", padx=10, pady=(2, 6))
+
     # ══════════════════════════════════════════════════════════════════════════
     #  Shared helpers
     # ══════════════════════════════════════════════════════════════════════════
     def _udp_send(self, prev: int, new: int):
         host = self.udp_host_var.get().strip()
         try:
-            send_port   = int(self.udp_port_var.get().strip())
+            send_port = int(self.udp_port_var.get().strip())
             listen_port = int(self.udp_listen_var.get().strip())
         except ValueError:
-            send_port   = UDP_SEND_PORT
+            send_port = UDP_SEND_PORT
             listen_port = UDP_LISTEN_PORT
-        self.udp.host        = host
-        self.udp.send_port   = send_port
+        self.udp.host = host
+        self.udp.send_port = send_port
         self.udp.listen_port = listen_port
-        self.udp.send(prev, new, self._udp_log_path, lambda: self.recorder.t0)
+        self.udp.send(prev, new, self._udp_log_path or self._log_path, lambda: self.recorder.t0)
+
+    def _emit_marker(self, prev: int, new: int, send_vicon_marker: bool = True):
+        self._udp_send(prev, new)
+        trigger_code = 15 if int(new) == 0 else int(new)
+        self.trigger_worker.send_marker_code(trigger_code)
+        if send_vicon_marker:
+            self.trigger_worker.send_vicon_marker()
 
     def _cur_marker(self, mode) -> int:
         """Read current marker from mode.PHASE_TO_MARKER, default 1."""
@@ -769,14 +913,18 @@ class ExpGUI(tk.Tk):
         sub  = os.path.join(root, subdir)
         os.makedirs(root, exist_ok=True)
         os.makedirs(sub,  exist_ok=True)
+        self._obs_trial_suffix = self._trial_str()
         self._csv_path         = os.path.join(root, f"{stem}.csv")
+        self._log_path         = os.path.join(root, f"{stem}_log.txt")
         self._udp_log_path     = os.path.join(root, f"{stem}_udp.txt")
         self._csv_path_sub     = os.path.join(sub,  f"{stem}.csv")
+        self._log_path_sub     = os.path.join(sub,  f"{stem}_log.txt")
         self._udp_log_path_sub = os.path.join(sub,  f"{stem}_udp.txt")
 
     def _copy_to_subdir(self):
         for src, dst in [
             (self._csv_path,     getattr(self, "_csv_path_sub",     None)),
+            (self._log_path,     getattr(self, "_log_path_sub",     None)),
             (self._udp_log_path, getattr(self, "_udp_log_path_sub", None)),
         ]:
             if src and dst and os.path.exists(src):
@@ -784,6 +932,19 @@ class ExpGUI(tk.Tk):
                     shutil.copy2(src, dst)
                 except Exception:
                     pass
+
+    def _write_log_header(self, params: dict):
+        try:
+            with open(self._log_path, "w", encoding="utf-8") as f:
+                f.write(f"experiment:       {params.pop('experiment', '?')}\n")
+                f.write(f"start_time_local: {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}\n")
+                f.write(f"trial:            {self._trial_str()}\n")
+                f.write(f"handedness:       {self.handedness_var.get()}\n")
+                for k, v in params.items():
+                    f.write(f"{k+':':<28}{v}\n")
+
+        except Exception:
+            pass
 
     def _write_udp_header(self, params: dict):
         try:
@@ -891,6 +1052,155 @@ class ExpGUI(tk.Tk):
         self.btn_lc_connect.config(state="normal")
         self.btn_lc_disconnect.config(state="disabled")
 
+    def on_trigger_connect(self):
+        port = self.trigger_port_var.get().strip()
+        if not port:
+            messagebox.showerror("Error", "Enter trigger Arduino COM port.")
+            return
+        if self.trigger_worker.connected:
+            return
+
+        def _ok():
+            self.after(0, lambda: (
+                self.trigger_status_var.set(f"Trigger: Connected ({port})"),
+                self.btn_trigger_connect.config(state="disabled"),
+                self.btn_trigger_disconnect.config(state="normal"),
+            ))
+
+        def _err(e):
+            self.after(0, lambda: self.trigger_status_var.set(f"Trigger: Error ({e})"))
+
+        self.trigger_status_var.set("Trigger: Connecting...")
+        self.trigger_worker.connect(port, on_success=_ok, on_error=_err)
+
+    def on_trigger_disconnect(self):
+        self.trigger_worker.disconnect()
+        self.trigger_status_var.set("Trigger: Disconnected")
+        self.btn_trigger_connect.config(state="normal")
+        self.btn_trigger_disconnect.config(state="disabled")
+
+    def on_obs_connect(self):
+        host = self.obs_host_var.get().strip() or OBS_HOST
+        try:
+            port = int(self.obs_port_var.get().strip())
+        except ValueError:
+            messagebox.showerror("Error", "OBS port must be an integer.")
+            return
+        password = self.obs_password_var.get()
+        if self.obs_worker.connected:
+            return
+
+        def _ok():
+            self.after(0, lambda: (
+                self.obs_status_var.set(f"OBS: Connected ({host}:{port})"),
+                self.btn_obs_connect.config(state="disabled"),
+                self.btn_obs_disconnect.config(state="normal"),
+            ))
+
+        def _err(e):
+            self.after(0, lambda: self.obs_status_var.set(f"OBS: Error ({e})"))
+
+        self.obs_status_var.set("OBS: Connecting...")
+        self.obs_worker.connect(host, port, password=password, on_success=_ok, on_error=_err)
+
+    def on_obs_disconnect(self):
+        self.obs_worker.disconnect()
+        self.obs_status_var.set("OBS: Disconnected")
+        self.btn_obs_connect.config(state="normal")
+        self.btn_obs_disconnect.config(state="disabled")
+
+    def on_gopro_connect(self):
+        self.gopro_status_var.set("GoPro: Connecting...")
+        self._ensure_gopro_connected()
+
+    def on_gopro_disconnect(self):
+        self.gopro_worker.disconnect()
+        self.gopro_status_var.set("GoPro: Disconnected")
+        self.btn_gopro_connect.config(state="normal")
+        self.btn_gopro_disconnect.config(state="disabled")
+
+    def _ensure_gopro_connected(self):
+        base_url = self.gopro_base_var.get().strip() or GOPRO_BASE_URL
+        if self.gopro_worker.connected:
+            self.gopro_status_var.set(f"GoPro: Connected ({base_url})")
+            self.btn_gopro_connect.config(state="disabled")
+            self.btn_gopro_disconnect.config(state="normal")
+            return True
+
+        error_text = {"value": ""}
+
+        def _ok():
+            self.gopro_status_var.set(f"GoPro: Connected ({base_url})")
+            self.btn_gopro_connect.config(state="disabled")
+            self.btn_gopro_disconnect.config(state="normal")
+
+        def _err(e):
+            error_text["value"] = str(e)
+
+        self.gopro_worker.connect(base_url, on_success=_ok, on_error=_err)
+        if self.gopro_worker.connected:
+            return True
+        if error_text["value"]:
+            self.gopro_status_var.set(f"GoPro: Error ({error_text['value']})")
+        return False
+
+    def _obs_start_recording(self):
+        if not self.obs_worker.connected:
+            return
+        self.obs_worker.start_recording(
+            suffix=self._obs_trial_suffix,
+            on_error=lambda e: self.after(0, lambda: self.obs_status_var.set(f"OBS: Error ({e})"))
+        )
+
+    def _obs_stop_recording(self):
+        if not self.obs_worker.connected:
+            return
+        self.obs_worker.stop_recording(
+            on_error=lambda e: self.after(0, lambda: self.obs_status_var.set(f"OBS: Error ({e})"))
+        )
+
+    def _gopro_start_recording(self):
+        if not self.gopro_worker.connected:
+            return
+        self.gopro_worker.start_recording(
+            on_error=lambda e: self.after(0, lambda: self.gopro_status_var.set(f"GoPro: Error ({e})"))
+        )
+        if self.gopro_worker.recording:
+            self.gopro_status_var.set("GoPro: Recording")
+
+    def _gopro_stop_recording(self):
+        if not self.gopro_worker.connected:
+            return
+        self.gopro_worker.stop_recording(
+            on_error=lambda e: self.after(0, lambda: self.gopro_status_var.set(f"GoPro: Error ({e})"))
+        )
+        if self.gopro_worker.connected and not self.gopro_worker.recording:
+            self.gopro_status_var.set(f"GoPro: Connected ({self.gopro_base_var.get().strip() or GOPRO_BASE_URL})")
+
+    def _require_experiment_connections(self):
+        if not self.serial_worker.connected:
+            messagebox.showerror("Error", "Connect Exo Serial first.")
+            return False
+        if not self.lc_worker.connected:
+            messagebox.showerror("Error", "Connect Load Cell first.")
+            return False
+        return True
+
+    def _safe_optional_call(self, func, status_var=None, label="Optional device"):
+        try:
+            func()
+        except Exception as exc:
+            if status_var is not None:
+                status_var.set(f"{label}: Error ({exc})")
+
+    def _start_session_recording(self):
+        self._safe_optional_call(self._obs_start_recording, self.obs_status_var, "OBS")
+        self._safe_optional_call(self._gopro_start_recording, self.gopro_status_var, "GoPro")
+
+    def _stop_session_recording(self):
+        self._safe_optional_call(self._obs_stop_recording, self.obs_status_var, "OBS")
+        self._safe_optional_call(self._gopro_stop_recording, self.gopro_status_var, "GoPro")
+
     def on_zero(self):
         sample, _ = self.serial_worker.ring.get_latest()
         if sample and len(sample) >= 8:
@@ -903,12 +1213,6 @@ class ExpGUI(tk.Tk):
             encoder_wrist = (sample[6] - self.wrist_zero) / GEAR_RATIO
             imu_raw = self._quat_to_imu(sample[1], sample[2], sample[3], sample[4])
             self.imu_zero = imu_raw - encoder_wrist
-
-    def on_zero_lc(self):
-        if not self.lc_worker.connected:
-            messagebox.showerror("Error", "LC not connected.")
-            return
-        self.lc_worker.retare()
 
     def _on_servo_scale(self, val):
         if not hasattr(self, "servo_entry"):
@@ -977,13 +1281,8 @@ class ExpGUI(tk.Tk):
     #  Rest handlers
     # ══════════════════════════════════════════════════════════════════════════
     def rest_on_start(self):
-        if not self.serial_worker.connected:
-            messagebox.showerror("Error", "Connect Serial first.")
+        if not self._require_experiment_connections():
             return
-        if not self.lc_worker.connected:
-            if not messagebox.askyesno("LC not connected",
-                    "Load Cell is not connected — LC columns will be empty.\nProceed anyway?"):
-                return
         rest_angle = self._parse_float(self.rest_angle_var, 0.0)
         damper     = int(self.rest_damper_var.get())
         mode = RestMode(rest_angle_deg=rest_angle, damper_pwm=damper)
@@ -993,6 +1292,9 @@ class ExpGUI(tk.Tk):
         hand_str = "R" if self.handedness_var.get() == "Right" else "L"
         stem     = f"REST_{hand_str}_{ts}_{self._trial_str()}"
         self._make_file_paths("rest", stem)
+        self._write_log_header({"experiment": "rest",
+                                 "hold_angle_deg": f"{rest_angle:.3f}",
+                                 "damper_pwm": damper})
         self._write_udp_header({"experiment": "rest",
                                  "hold_angle_deg": f"{rest_angle:.3f}",
                                  "damper_pwm": damper})
@@ -1000,14 +1302,18 @@ class ExpGUI(tk.Tk):
         self.rest_btn_stop.config(state="disabled")
         self.motion_status.set("REST — starting in 3…")
  
+        self._am_active_segments = []
+        self._am_return_segments = []
+        self._am_go_start_ts = None
+        self._am_return_start_ts = None
+
         def _launch():
             self.motion_runner.start(mode)
             self.serial_worker.send("TORQUE_ON")
             self.recorder.start(self._csv_path, mode)
+            self._start_session_recording()
             self.recorder.set_marker(1)
-            get_t0 = lambda: self.recorder.t0
-            self.udp.start_listen(self._udp_log_path, get_t0)
-            self._udp_send(0, 1)
+            self._emit_marker(0, 1, send_vicon_marker=False)
             self.motion_status.set(f"REST — servo holding {rest_angle:.1f}°")
             self.aan_phase_var.set(mode.phase)
             self.rec_status_var.set(f"Recording → {os.path.basename(self._csv_path)}")
@@ -1016,9 +1322,10 @@ class ExpGUI(tk.Tk):
         self.display.countdown(_launch)
 
     def rest_on_stop(self):
-        self._udp_send(1, 0)
+        self._emit_marker(1, 0, send_vicon_marker=False)
         rows = self.recorder.get_rows()
         self.recorder.stop()
+        self._stop_session_recording()
         self._copy_to_subdir()
         try:
             self.motion_runner.stop(release=False)
@@ -1029,7 +1336,6 @@ class ExpGUI(tk.Tk):
         self.motion_status.set("Idle")
         self.aan_phase_var.set("—")
         self.rec_status_var.set(f"Saved: {os.path.basename(self._csv_path)}  ({rows:,} rows)")
-        self.udp.stop_listen()
         self.rest_btn_start.config(state="normal")
         self.rest_btn_stop.config(state="disabled")
         self._draw_canvas_idle()
@@ -1039,13 +1345,8 @@ class ExpGUI(tk.Tk):
     #  Calibration handlers
     # ══════════════════════════════════════════════════════════════════════════
     def calibration_on_start(self):
-        if not self.serial_worker.connected:
-            messagebox.showerror("Error", "Connect Serial first.")
+        if not self._require_experiment_connections():
             return
-        if not self.lc_worker.connected:
-            if not messagebox.askyesno("LC not connected",
-                    "Load Cell is not connected — LC columns will be empty.\nProceed anyway?"):
-                return
         start_angle = self._parse_float(self.cal_start_angle_var, 0.0)
         damper      = int(self.cal_damper_var.get())
 
@@ -1058,6 +1359,9 @@ class ExpGUI(tk.Tk):
         self._cal_hold_marker_sent = False
         self._cal_return_start_ts  = None
         self._cal_return_stop_ts   = None
+        self._write_log_header({"experiment":      "calibration",
+                                 "start_angle_deg": f"{start_angle:.3f}",
+                                 "damper_pwm":      damper})
         self._write_udp_header({"experiment":      "calibration",
                                  "start_angle_deg": f"{start_angle:.3f}",
                                  "damper_pwm":      damper})
@@ -1072,17 +1376,16 @@ class ExpGUI(tk.Tk):
             self.motion_runner.start(mode)
             self.serial_worker.send("TORQUE_ON")
             self.recorder.start(self._csv_path, mode)
+            self._start_session_recording()
             self.recorder.set_marker(1)
-            get_t0 = lambda: self.recorder.t0
-            self.udp.start_listen(self._udp_log_path, get_t0)
-            self.udp.send(0, 1, self._udp_log_path, get_t0)
+            self._emit_marker(0, 1, send_vicon_marker=False)
 
             def _on_phase(prev_sp, new_sp):
                 prev_m = CalibrationMode.PHASE_TO_MARKER.get(prev_sp, 0)
                 new_m  = CalibrationMode.PHASE_TO_MARKER.get(new_sp, 0)
                 self.recorder.set_marker(new_m)
                 if prev_m != new_m:
-                    self.udp.send(prev_m, new_m, self._udp_log_path, get_t0)
+                    self._emit_marker(prev_m, new_m, send_vicon_marker=(new_sp != "done"))
                 self.after(0, lambda s=new_sp: self._cal_on_phase_ui(s))
 
             mode.on_phase_change = _on_phase
@@ -1111,7 +1414,7 @@ class ExpGUI(tk.Tk):
 
         if phase == "return":
             self.serial_worker.send("TORQUE_OFF")
-            self._cal_return_start_ts = local_clock()
+            self._cal_return_start_ts = time.perf_counter()
 
         if phase == "done":
             self.after(200, self.calibration_on_stop)
@@ -1126,16 +1429,17 @@ class ExpGUI(tk.Tk):
         mode = self.motion_runner.active_mode
         if mode is None or mode.name != "calibration":
             return
-        self._cal_return_stop_ts = local_clock()
+        self._cal_return_stop_ts = time.perf_counter()
         mode.mark_final()
 
     def calibration_on_stop(self):
         self._motion_polling = False
         cur = self.recorder.current_marker
         if cur != 0:
-            self._udp_send(cur, 0)
+            self._emit_marker(cur, 0, send_vicon_marker=False)
         rows = self.recorder.get_rows()
         self.recorder.stop()
+        self._stop_session_recording()
         self._copy_to_subdir()
         avg_speed = self._compute_calibration_return_speed()
         self._write_calibration_summary(avg_speed)
@@ -1151,7 +1455,6 @@ class ExpGUI(tk.Tk):
         else:
             self.cal_phase_var.set(f"saved — average return speed = {avg_speed:.2f} deg/s")
         self.rec_status_var.set(f"Saved: {os.path.basename(self._csv_path)}  ({rows:,} rows)")
-        self.udp.stop_listen()
         self.cal_btn_start.config(state="normal")
         self.cal_btn_return.config(state="disabled")
         self.cal_btn_final.config(state="disabled")
@@ -1172,7 +1475,7 @@ class ExpGUI(tk.Tk):
         if mode.sub_phase == "hold" and not self._cal_hold_marker_sent:
             self._cal_hold_marker_sent = True
             self.recorder.set_marker(2)
-            self.udp.send(1, 2, self._udp_log_path, lambda: self.recorder.t0)
+            self._emit_marker(1, 2)
             self.cal_btn_return.config(state="normal")
             self.motion_status.set("CALIBRATION — hold at start angle, press Return when ready")
         self.after(interval_ms, self._calibration_ui_loop)
@@ -1202,7 +1505,7 @@ class ExpGUI(tk.Tk):
 
     def _write_calibration_summary(self, avg_speed_deg_s):
         try:
-            with open(self._udp_log_path, "a", encoding="utf-8") as f:
+            with open(self._log_path, "a", encoding="utf-8") as f:
                 f.write("\n" + "=" * 44 + "\n")
                 f.write("Calibration Summary\n")
                 f.write(f"start_angle_deg:              {self._parse_float(self.cal_start_angle_var, 0.0):.3f}\n")
@@ -1219,14 +1522,69 @@ class ExpGUI(tk.Tk):
 # ══════════════════════════════════════════════════════════════════════════
     #  ROM handlers
     # ══════════════════════════════════════════════════════════════════════════
-    def rom_on_start(self):
-        if not self.serial_worker.connected:
-            messagebox.showerror("Error", "Connect Serial first.")
-            return
-        if not self.lc_worker.connected:
-            if not messagebox.askyesno("LC not connected",
-                    "Load Cell is not connected — LC columns will be empty.\nProceed anyway?"):
+    def _compute_am_segment_stats(self, segments):
+        try:
+            total_duration = 0.0
+            total_path = 0.0
+            valid_segments = 0
+            for start_ts, stop_ts in segments:
+                if start_ts is None or stop_ts is None or stop_ts <= start_ts:
+                    continue
+                frames = []
+                for ts, s in self.serial_worker.ring.get_since(start_ts - 1e-6):
+                    if ts < start_ts:
+                        continue
+                    if ts > stop_ts:
+                        break
+                    if s and len(s) >= 7:
+                        wrist = (s[6] - self.wrist_zero) / GEAR_RATIO
+                        frames.append((ts, wrist))
+                if len(frames) < 2:
+                    continue
+                duration = frames[-1][0] - frames[0][0]
+                if duration <= 1e-6:
+                    continue
+                path = sum(abs(frames[i][1] - frames[i - 1][1]) for i in range(1, len(frames)))
+                total_duration += duration
+                total_path += path
+                valid_segments += 1
+            if valid_segments == 0 or total_duration <= 1e-6:
+                return None
+            return {
+                "segments": valid_segments,
+                "duration_s": total_duration,
+                "path_deg": total_path,
+                "avg_speed_deg_s": total_path / total_duration,
+            }
+        except Exception:
+            return None
+
+    def _write_active_movement_summary(self, active_stats, return_stats):
+        def _write_stats(f, prefix, stats):
+            if stats is None:
+                f.write(f"{prefix}_segments:                  0\n")
+                f.write(f"{prefix}_duration_s:                NA\n")
+                f.write(f"{prefix}_path_deg:                  NA\n")
+                f.write(f"average_{prefix}_speed_deg_s:       NA\n")
                 return
+            f.write(f"{prefix}_segments:                  {stats['segments']}\n")
+            f.write(f"{prefix}_duration_s:                {stats['duration_s']:.6f}\n")
+            f.write(f"{prefix}_path_deg:                  {stats['path_deg']:.6f}\n")
+            f.write(f"average_{prefix}_speed_deg_s:       {stats['avg_speed_deg_s']:.6f}\n")
+
+        try:
+            with open(self._log_path, "a", encoding="utf-8") as f:
+                f.write("\n" + "=" * 44 + "\n")
+                f.write("Active Movement Summary\n")
+                _write_stats(f, "active", active_stats)
+                _write_stats(f, "return", return_stats)
+                f.write("=" * 44 + "\n")
+        except Exception:
+            pass
+
+    def rom_on_start(self):
+        if not self._require_experiment_connections():
+            return
         direction     = self._get_direction()
         damper        = int(self.calib_damper_var.get())
         passive_speed = self._parse_float(self.rom_passive_speed_var, 20.0)
@@ -1252,6 +1610,13 @@ class ExpGUI(tk.Tk):
         dir_str  = "ext" if direction >= 0 else "flex"
         stem     = f"ROM_{hand_str}_{dir_str}_{ts}_{self._trial_str()}"
         self._make_file_paths("rom", stem)
+        self._write_log_header({"experiment":           "rom_assessment",
+                                 "direction":           "extension" if direction >= 0 else "flexion",
+                                 "passive_speed_deg_s": passive_speed,
+                                 "damper_pwm":          damper,
+                                 "hold_time_s":         hold_time,
+                                 "rest_time_s":         rest_time,
+                                 "total_reps":          total_reps})
         self._write_udp_header({"experiment":           "rom_assessment",
                                  "direction":           "extension" if direction >= 0 else "flexion",
                                  "passive_speed_deg_s": passive_speed,
@@ -1270,17 +1635,16 @@ class ExpGUI(tk.Tk):
             self.motion_runner.start(mode)
             self.serial_worker.send("TORQUE_OFF")
             self.recorder.start(self._csv_path, mode)
+            self._start_session_recording()
             self.recorder.set_marker(1)
-            get_t0 = lambda: self.recorder.t0
-            self.udp.start_listen(self._udp_log_path, get_t0)
-            self._udp_send(0, 1)
+            self._emit_marker(0, 1, send_vicon_marker=False)
 
             def _on_phase(prev_sp, new_sp):
                 prev_m = ROMMode.PHASE_TO_MARKER.get(prev_sp, 0)
                 new_m  = ROMMode.PHASE_TO_MARKER.get(new_sp, 0)
                 self.recorder.set_marker(new_m)
                 if prev_m != new_m:
-                    self.udp.send(prev_m, new_m, self._udp_log_path, get_t0)
+                    self._emit_marker(prev_m, new_m, send_vicon_marker=(new_sp != "done"))
                 self.after(0, lambda s=new_sp: self._rom_on_phase_ui(s))
 
             mode.on_phase_change = _on_phase
@@ -1336,9 +1700,10 @@ class ExpGUI(tk.Tk):
         self._motion_polling = False
         cur = self.recorder.current_marker
         if cur != 0:
-            self._udp_send(cur, 0)
+            self._emit_marker(cur, 0, send_vicon_marker=False)
         rows = self.recorder.get_rows()
         self.recorder.stop()
+        self._stop_session_recording()
         self._copy_to_subdir()
         try:
             self.motion_runner.stop(release=False)
@@ -1349,7 +1714,6 @@ class ExpGUI(tk.Tk):
         self.motion_status.set("Idle")
         self.rom_info_var.set("—")
         self.rec_status_var.set(f"Saved: {os.path.basename(self._csv_path)}  ({rows:,} rows)")
-        self.udp.stop_listen()
         self.calib_btn_start.config(state="normal")
         self.calib_btn_stop.config(state="disabled")
         self.calib_btn_active_end.config(state="disabled")
@@ -1410,13 +1774,8 @@ class ExpGUI(tk.Tk):
     #  AAN handlers
     # ══════════════════════════════════════════════════════════════════════════
     def aan_on_start(self):
-        if not self.serial_worker.connected:
-            messagebox.showerror("Error", "Connect Serial first.")
+        if not self._require_experiment_connections():
             return
-        if not self.lc_worker.connected:
-            if not messagebox.askyesno("LC not connected",
-                    "Load Cell is not connected — LC columns will be empty.\nProceed anyway?"):
-                return
         direction   = self._get_direction()
         active_end  = self._parse_float(self.aan_active_end_var,  30.0)
         passive_end = self._parse_float(self.aan_passive_end_var, 50.0)
@@ -1461,6 +1820,19 @@ class ExpGUI(tk.Tk):
         dir_str  = "ext" if direction >= 0 else "flex"
         stem     = f"AAN_{hand_str}_{dir_str}_{ts}_{self._trial_str()}"
         self._make_file_paths("aan", stem)
+        self._write_log_header({"experiment":           "aan",
+                                 "direction":           "extension" if direction >= 0 else "flexion",
+                                 "active_end_deg":      active_end,
+                                 "passive_end_deg":     passive_end,
+                                 "passive_speed_deg_s": speed,
+                                 "active_timeout_s":    timeout,
+                                 "pre_passive_pause_s": pause,
+                                 "damper_pwm":          damper,
+                                 "damper_on_return":    damper_ret,
+                                 "hold_time_s":         hold_time,
+                                 "return_time_s":       return_time,
+                                 "rest_time_s":         rest_time,
+                                 "total_reps":          total_reps})
         self._write_udp_header({"experiment":           "aan",
                                  "direction":           "extension" if direction >= 0 else "flexion",
                                  "active_end_deg":      active_end,
@@ -1481,17 +1853,16 @@ class ExpGUI(tk.Tk):
 
         def _launch():
             self.recorder.start(self._csv_path, mode)
+            self._start_session_recording()
             self.recorder.set_marker(1)
-            get_t0 = lambda: self.recorder.t0
-            self.udp.start_listen(self._udp_log_path, get_t0)
-            self.udp.send(0, 1, self._udp_log_path, get_t0)
+            self._emit_marker(0, 1, send_vicon_marker=False)
 
             def _on_phase(prev_sp, new_sp):
                 prev_m = AANMode.PHASE_TO_MARKER.get(prev_sp, 0)
                 new_m  = AANMode.PHASE_TO_MARKER.get(new_sp, 0)
                 self.recorder.set_marker(new_m)
                 if prev_m != new_m:
-                    self.udp.send(prev_m, new_m, self._udp_log_path, get_t0)
+                    self._emit_marker(prev_m, new_m, send_vicon_marker=(new_sp != "done"))
                 self.after(0, lambda s=new_sp: self._aan_on_phase_ui(
                     s, passive_end, speed, pause, return_time, damper_ret))
 
@@ -1518,7 +1889,7 @@ class ExpGUI(tk.Tk):
             "passive":     f"AAN — PASSIVE, servo driving to {passive_end}° at {speed}°/s",
             "hold":        "AAN — HOLD at passive end",
             "return":      f"AAN — RETURN window {return_time:.1f}s, damper {'ON' if damper_ret else 'OFF'}",
-            "servo_back":  "AAN — servo returning hand to 0°",
+            "servo_back":  "AAN — servo returning hand to 0°" if return_time > 0 else "AAN — skipping return window, servo returning to 0°",
             "rest":        "AAN — resting before next rep",
             "done":        "AAN — complete",
         }
@@ -1555,9 +1926,10 @@ class ExpGUI(tk.Tk):
         self._motion_polling = False
         cur = self.recorder.current_marker
         if cur != 0:
-            self._udp_send(cur, 0)
+            self._emit_marker(cur, 0, send_vicon_marker=False)
         rows = self.recorder.get_rows()
         self.recorder.stop()
+        self._stop_session_recording()
         self._copy_to_subdir()
         try:
             self.motion_runner.stop(release=False)
@@ -1568,7 +1940,6 @@ class ExpGUI(tk.Tk):
         self.motion_status.set("Idle")
         self.aan_phase_var.set("—")
         self.rec_status_var.set(f"Saved: {os.path.basename(self._csv_path)}  ({rows:,} rows)")
-        self.udp.stop_listen()
         self.aan_btn_start.config(state="normal")
         self.aan_btn_stop.config(state="disabled")
         self._draw_canvas_idle()
@@ -1626,13 +1997,8 @@ class ExpGUI(tk.Tk):
     #  Passive Movement handlers
     # ══════════════════════════════════════════════════════════════════════════
     def pm_on_start(self):
-        if not self.serial_worker.connected:
-            messagebox.showerror("Error", "Connect Serial first.")
+        if not self._require_experiment_connections():
             return
-        if not self.lc_worker.connected:
-            if not messagebox.askyesno("LC not connected",
-                    "Load Cell is not connected — LC columns will be empty.\nProceed anyway?"):
-                return
         try:
             direction = int(self._get_direction())
         except ValueError:
@@ -1670,6 +2036,15 @@ class ExpGUI(tk.Tk):
         dir_str  = "ext" if direction >= 0 else "flex"
         stem     = f"PM_{hand_str}_{dir_str}_{ts}_{self._trial_str()}"
         self._make_file_paths("passive_movement", stem)
+        self._write_log_header({"experiment":        "passive_movement",
+                                 "direction":        "extension" if direction >= 0 else "flexion",
+                                 "target_wrist_deg": target,
+                                 "active_end_deg":   active_end,
+                                 "speed_wrist_deg_s": speed,
+                                 "hold_duration_s":  hold,
+                                 "rest_time_s":      rest,
+                                 "damper_pwm":       damper,
+                                 "total_reps":       total_reps})
         self._write_udp_header({"experiment":        "passive_movement",
                                  "direction":        "extension" if direction >= 0 else "flexion",
                                  "target_wrist_deg": target,
@@ -1685,8 +2060,6 @@ class ExpGUI(tk.Tk):
         self.motion_status.set("PASSIVE MOVE — starting in 3…")
 
         def _launch():
-            get_t0 = lambda: self.recorder.t0
-
             def _on_phase(prev_sp, new_sp):
                 prev_m = mode.PHASE_TO_MARKER.get(prev_sp, 0)
                 new_m  = mode.PHASE_TO_MARKER.get(new_sp, 0)
@@ -1700,7 +2073,7 @@ class ExpGUI(tk.Tk):
                 }.get(new_sp, float(new_m))
                 self.recorder.set_marker(float_marker)
                 if prev_m != new_m:
-                    self.udp.send(prev_m, new_m, self._udp_log_path, get_t0)
+                    self._emit_marker(prev_m, new_m, send_vicon_marker=(new_sp != "done"))
                 total = int(round(mode.params.get("total_reps", 1)))
                 self.after(0, lambda s=new_sp: self.pm_phase_var.set(
                     f"phase={s}  |  rep={mode.rep+1}/{total}  target={target}°"))
@@ -1710,15 +2083,15 @@ class ExpGUI(tk.Tk):
                     # CSV: 1.0 → 1.5
                     self.recorder.set_marker(1.5)
                     # UDP: 1→1 (event marker, same value)
-                    self.udp.send(1, 1, self._udp_log_path, get_t0)
+                    self._emit_marker(1, 1)
                 else:  # return
                     # CSV: 2.5 → 3.0
                     self.recorder.set_marker(3.0)
                     # UDP: 3→3 (event marker)
-                    self.udp.send(3, 3, self._udp_log_path, get_t0)
+                    self._emit_marker(3, 3)
 
             self.recorder.start(self._csv_path, mode)
-            self.udp.start_listen(self._udp_log_path, get_t0)
+            self._start_session_recording()
             self.motion_runner.start(mode)
             mode.on_phase_change   = _on_phase
             mode.on_active_reached = _on_active_reached
@@ -1738,9 +2111,10 @@ class ExpGUI(tk.Tk):
         self._motion_polling = False
         cur = self.recorder.current_marker
         if cur != 0:
-            self._udp_send(int(cur), 0)
+            self._emit_marker(int(cur), 0, send_vicon_marker=False)
         rows = self.recorder.get_rows()
         self.recorder.stop()
+        self._stop_session_recording()
         self._copy_to_subdir()
         try:
             self.motion_runner.stop(release=False)
@@ -1751,7 +2125,6 @@ class ExpGUI(tk.Tk):
         self.motion_status.set("Idle")
         self.pm_phase_var.set("—")
         self.rec_status_var.set(f"Saved: {os.path.basename(self._csv_path)}  ({rows:,} rows)")
-        self.udp.stop_listen()
         self.pm_btn_start.config(state="normal")
         self.pm_btn_stop.config(state="disabled")
         self._draw_canvas_idle()
@@ -1822,7 +2195,7 @@ class ExpGUI(tk.Tk):
     #     hand_str = "R" if h == 1 else "L"
     #     stem     = f"BF_{hand_str}_{ts}_{self._trial_str()}"
     #     self._make_file_paths("back_and_forth", stem)
-    #     self._write_udp_header({"experiment": "back_and_forth",
+    #     self._write_log_header({"experiment": "back_and_forth",
     #                              "left_deg": left, "right_deg": right,
     #                              "speed_deg_s": speed, "reps": reps,
     #                              "damper_pwm": damper})
@@ -1833,9 +2206,9 @@ class ExpGUI(tk.Tk):
     #     def _launch():
     #         get_t0 = lambda: self.recorder.t0
     #         self.recorder.start(self._csv_path, mode)
-    #         self.udp.start_listen(self._udp_log_path, get_t0)
+    #         self.udp.start_listen(self._log_path, get_t0)
     #         self.recorder.set_marker(1)
-    #         self.udp.send(0, 1, self._udp_log_path, get_t0)
+    #         self.outlet.push_sample([1])
     #         self.motion_runner.start(mode)
     #         self.serial_worker.send("TORQUE_ON")
     #         wrist_now = self._get_wrist()
@@ -1851,7 +2224,7 @@ class ExpGUI(tk.Tk):
 
     # def bf_on_stop(self):
     #     self._motion_polling = False
-    #     self._udp_send(1, 0)
+    #     self._lsl_send(1, 0)
     #     rows = self.recorder.get_rows()
     #     self.recorder.stop()
     #     self._copy_to_subdir()
@@ -1894,13 +2267,8 @@ class ExpGUI(tk.Tk):
     #  RAH handlers
     # ══════════════════════════════════════════════════════════════════════════
     def rah_on_start(self):
-        if not self.serial_worker.connected:
-            messagebox.showerror("Error", "Connect Serial first.")
+        if not self._require_experiment_connections():
             return
-        if not self.lc_worker.connected:
-            if not messagebox.askyesno("LC not connected",
-                    "Load Cell is not connected — LC data will be empty.\nProceed anyway?"):
-                return
         direction = self._get_direction()
         limit     = self._parse_float(self.rah_limit_var, 10.0)
         channel   = self.rah_channel_var.get()
@@ -1922,16 +2290,20 @@ class ExpGUI(tk.Tk):
 
         def _launch():
             wrist_now = self._get_wrist()
+            self._write_log_header({"experiment":    "ramp_and_hold",
+                                     "direction":    "extension" if direction >= 0 else "flexion",
+                                     "hold_angle_deg": f"{wrist_now:.3f}",
+                                     "torque_limit": limit,
+                                     "lc_channel":   channel})
             self._write_udp_header({"experiment":    "ramp_and_hold",
                                      "direction":    "extension" if direction >= 0 else "flexion",
                                      "hold_angle_deg": f"{wrist_now:.3f}",
                                      "torque_limit": limit,
                                      "lc_channel":   channel})
-            get_t0 = lambda: self.recorder.t0
             self.recorder.start(self._csv_path, mode)
-            self.udp.start_listen(self._udp_log_path, get_t0)
+            self._start_session_recording()
             self.recorder.set_marker(1)
-            self.udp.send(0, 1, self._udp_log_path, get_t0)
+            self._emit_marker(0, 1, send_vicon_marker=False)
             self._rah_t0      = time.time()
             self._rah_history = []
             self.motion_runner.start(mode)
@@ -1950,9 +2322,10 @@ class ExpGUI(tk.Tk):
 
     def rah_on_stop(self):
         self._motion_polling = False
-        self._udp_send(1, 0)
+        self._emit_marker(1, 0, send_vicon_marker=False)
         rows = self.recorder.get_rows()
         self.recorder.stop()
+        self._stop_session_recording()
         self._copy_to_subdir()
         try:
             self.motion_runner.stop(release=False)
@@ -1963,7 +2336,6 @@ class ExpGUI(tk.Tk):
         self.motion_status.set("Idle")
         self.rah_phase_var.set("—")
         self.rec_status_var.set(f"Saved: {os.path.basename(self._csv_path)}  ({rows:,} rows)")
-        self.udp.stop_listen()
         self.rah_btn_start.config(state="normal")
         self.rah_btn_stop.config(state="disabled")
         self._draw_rah_canvas_idle()
@@ -1988,13 +2360,8 @@ class ExpGUI(tk.Tk):
     #  Active Movement handlers
     # ══════════════════════════════════════════════════════════════════════════
     def am_on_start(self):
-        if not self.serial_worker.connected:
-            messagebox.showerror("Error", "Connect Serial first.")
+        if not self._require_experiment_connections():
             return
-        if not self.lc_worker.connected:
-            if not messagebox.askyesno("LC not connected",
-                    "Load Cell is not connected — LC columns will be empty.\nProceed anyway?"):
-                return
         try:
             direction = int(self._get_direction())
         except ValueError:
@@ -2019,6 +2386,12 @@ class ExpGUI(tk.Tk):
         dir_str  = "ext" if direction >= 0 else "flex"
         stem     = f"AM_{hand_str}_{dir_str}_{ts}_{self._trial_str()}"
         self._make_file_paths("active_movement", stem)
+        self._write_log_header({"experiment":    "active_movement",
+                                 "direction":    "extension" if direction >= 0 else "flexion",
+                                 "damper_pwm":   damper,
+                                 "return_tol_deg": return_tol,
+                                 "rest_time_s":  rest_time,
+                                 "total_reps":   total_reps})
         self._write_udp_header({"experiment":    "active_movement",
                                  "direction":    "extension" if direction >= 0 else "flexion",
                                  "damper_pwm":   damper,
@@ -2032,14 +2405,26 @@ class ExpGUI(tk.Tk):
         self.motion_status.set("ACTIVE MOVE — starting in 3…")
 
         def _launch():
-            get_t0 = lambda: self.recorder.t0
-
             def _on_phase(prev_sp, new_sp):
+                now_ts = time.perf_counter()
+                if new_sp == "go":
+                    self._am_go_start_ts = now_ts
+                    self._am_return_start_ts = None
+                if prev_sp == "go" and new_sp == "return":
+                    if self._am_go_start_ts is not None:
+                        self._am_active_segments.append((self._am_go_start_ts, now_ts))
+                    self._am_go_start_ts = None
+                    self._am_return_start_ts = now_ts
+                if prev_sp == "return" and new_sp == "rest":
+                    if self._am_return_start_ts is not None:
+                        self._am_return_segments.append((self._am_return_start_ts, now_ts))
+                    self._am_return_start_ts = None
+
                 prev_m = ActiveMovementMode.PHASE_TO_MARKER.get(prev_sp, 0)
                 new_m  = ActiveMovementMode.PHASE_TO_MARKER.get(new_sp, 0)
                 self.recorder.set_marker(new_m)
                 if prev_m != new_m:
-                    self.udp.send(prev_m, new_m, self._udp_log_path, get_t0)
+                    self._emit_marker(prev_m, new_m, send_vicon_marker=(new_sp != "done"))
                 total = int(round(mode.params.get("total_reps", 1)))
                 self.after(0, lambda s=new_sp: (
                     self.am_phase_var.set(
@@ -2051,12 +2436,12 @@ class ExpGUI(tk.Tk):
                     self.after(200, self.am_on_stop)
 
             self.recorder.start(self._csv_path, mode)
-            self.udp.start_listen(self._udp_log_path, get_t0)
+            self._start_session_recording()
             self.motion_runner.start(mode)
             mode.on_phase_change = _on_phase
             self.serial_worker.send("TORQUE_OFF")
             self.recorder.set_marker(1)
-            # self.udp.send(0, 1, self._udp_log_path, get_t0)
+            self._emit_marker(0, 1, send_vicon_marker=False)
             mode.start_go()
             self.motion_status.set(f"ACTIVE MOVE — move in {'extension' if direction >= 0 else 'flexion'} direction")
             self.am_phase_var.set(f"phase=go  |  rep=1/{total_reps}")
@@ -2076,11 +2461,24 @@ class ExpGUI(tk.Tk):
 
     def am_on_stop(self):
         self._motion_polling = False
+        now_ts = time.perf_counter()
+        mode = self.motion_runner.active_mode
+        if mode is not None and mode.name == "active_movement":
+            if mode.sub_phase == "go" and self._am_go_start_ts is not None:
+                self._am_active_segments.append((self._am_go_start_ts, now_ts))
+                self._am_go_start_ts = None
+            elif mode.sub_phase == "return" and self._am_return_start_ts is not None:
+                self._am_return_segments.append((self._am_return_start_ts, now_ts))
+                self._am_return_start_ts = None
         cur = self.recorder.current_marker
         if cur != 0:
-            self._udp_send(int(cur), 0)
+            self._emit_marker(int(cur), 0, send_vicon_marker=False)
         rows = self.recorder.get_rows()
+        active_stats = self._compute_am_segment_stats(self._am_active_segments)
+        return_stats = self._compute_am_segment_stats(self._am_return_segments)
         self.recorder.stop()
+        self._write_active_movement_summary(active_stats, return_stats)
+        self._stop_session_recording()
         self._copy_to_subdir()
         try:
             self.motion_runner.stop(release=False)
@@ -2090,8 +2488,13 @@ class ExpGUI(tk.Tk):
         self.serial_worker.send("SET_DMP:0")
         self.motion_status.set("Idle")
         self.am_phase_var.set("—")
-        self.rec_status_var.set(f"Saved: {os.path.basename(self._csv_path)}  ({rows:,} rows)")
-        self.udp.stop_listen()
+        if active_stats is not None and return_stats is not None:
+            self.rec_status_var.set(
+                f"Saved: {os.path.basename(self._csv_path)}  ({rows:,} rows)  "
+                f"active={active_stats['avg_speed_deg_s']:.2f} deg/s, "
+                f"return={return_stats['avg_speed_deg_s']:.2f} deg/s")
+        else:
+            self.rec_status_var.set(f"Saved: {os.path.basename(self._csv_path)}  ({rows:,} rows)")
         self.am_btn_start.config(state="normal")
         self.am_btn_end.config(state="disabled")
         self.am_btn_stop.config(state="disabled")
@@ -2123,6 +2526,160 @@ class ExpGUI(tk.Tk):
     # ══════════════════════════════════════════════════════════════════════════
     #  Canvas drawing
     # ══════════════════════════════════════════════════════════════════════════
+    def follow_on_start(self):
+        if not self._require_experiment_connections():
+            return
+
+        direction = self._get_direction()
+        target = self._parse_float(self.follow_target_var, 30.0)
+        speed = self._parse_float(self.follow_speed_var, 20.0)
+        hold = self._parse_float(self.follow_hold_var, 2.0)
+        rest = self._parse_float(self.follow_rest_var, 2.0)
+        damper = int(self.follow_damper_var.get())
+        h = 1 if self.handedness_var.get() == "Right" else -1
+        try:
+            total_reps = int(self.follow_reps_var.get())
+        except ValueError:
+            total_reps = 1
+
+        if target <= 0:
+            messagebox.showerror("Error", "Target must be > 0.")
+            return
+        if speed <= 0:
+            messagebox.showerror("Error", "Guide speed must be > 0.")
+            return
+
+        mode = FollowMode(
+            direction=direction,
+            target_deg=target,
+            speed_deg_s=speed,
+            hold_time_s=hold,
+            rest_time_s=rest,
+            damper_pwm=damper,
+            total_reps=total_reps,
+        )
+        mode.set_handedness(h)
+        mode.reset()
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        hand_str = "R" if h == 1 else "L"
+        dir_str = "ext" if direction >= 0 else "flex"
+        stem = f"FOLLOW_{hand_str}_{dir_str}_{ts}_{self._trial_str()}"
+        self._make_file_paths("follow", stem)
+        self._write_log_header({
+            "experiment": "follow",
+            "direction": "extension" if direction >= 0 else "flexion",
+            "target_deg": target,
+            "speed_deg_s": speed,
+            "hold_time_s": hold,
+            "rest_time_s": rest,
+            "damper_pwm": damper,
+            "total_reps": total_reps,
+        })
+        self._write_udp_header({
+            "experiment": "follow",
+            "direction": "extension" if direction >= 0 else "flexion",
+            "target_deg": target,
+            "speed_deg_s": speed,
+            "hold_time_s": hold,
+            "rest_time_s": rest,
+            "damper_pwm": damper,
+            "total_reps": total_reps,
+        })
+
+        self.follow_btn_start.config(state="disabled")
+        self.follow_btn_stop.config(state="disabled")
+        self.motion_status.set("FOLLOW — starting in 3...")
+
+        def _launch():
+            def _on_phase(prev_sp, new_sp):
+                prev_m = FollowMode.PHASE_TO_MARKER.get(prev_sp, 0)
+                new_m = FollowMode.PHASE_TO_MARKER.get(new_sp, 0)
+                self.recorder.set_marker(new_m)
+                if prev_m != new_m:
+                    self._emit_marker(prev_m, new_m, send_vicon_marker=(new_sp != "done"))
+                total = int(round(mode.params.get("total_reps", 1)))
+                self.after(0, lambda s=new_sp: self.follow_phase_var.set(
+                    f"phase={s}  |  rep={mode.rep+1}/{total}"))
+                if new_sp == "done":
+                    self.after(200, self.follow_on_stop)
+
+            self.recorder.start(self._csv_path, mode)
+            self._start_session_recording()
+            self.motion_runner.start(mode)
+            mode.on_phase_change = _on_phase
+            self.serial_worker.send("TORQUE_OFF")
+            self.serial_worker.send(f"SET_DMP:{damper}")
+            self.recorder.set_marker(1)
+            self._emit_marker(0, 1, send_vicon_marker=False)
+            mode.start_go()
+            self.motion_status.set(
+                f"FOLLOW — track the yellow ball toward {target:.1f}° at {speed:.1f}°/s")
+            self.follow_phase_var.set(f"phase=go  |  rep=1/{total_reps}")
+            self.rec_status_var.set(f"Recording → {os.path.basename(self._csv_path)}")
+            self.follow_btn_stop.config(state="normal")
+            self._motion_polling = True
+            self._follow_ui_loop()
+
+        self.display.countdown(_launch)
+
+    def follow_on_stop(self):
+        self._motion_polling = False
+        cur = self.recorder.current_marker
+        if cur != 0:
+            self._emit_marker(int(cur), 0, send_vicon_marker=False)
+        rows = self.recorder.get_rows()
+        self.recorder.stop()
+        self._stop_session_recording()
+        self._copy_to_subdir()
+        try:
+            self.motion_runner.stop(release=False)
+        except Exception:
+            pass
+        self.serial_worker.send("TORQUE_OFF")
+        self.serial_worker.send("SET_DMP:0")
+        self.motion_status.set("Idle")
+        self.follow_phase_var.set("—")
+        self.rec_status_var.set(f"Saved: {os.path.basename(self._csv_path)}  ({rows:,} rows)")
+        self.follow_btn_start.config(state="normal")
+        self.follow_btn_stop.config(state="disabled")
+        self._draw_canvas_idle()
+        self._trial_increment()
+
+    def _follow_ui_loop(self, interval_ms=100):
+        if not self._motion_polling:
+            return
+        mode = self.motion_runner.active_mode
+        if mode is None or mode.name != "follow":
+            self.after(interval_ms, self._follow_ui_loop)
+            return
+
+        wrist = self._get_wrist()
+        total = int(round(mode.params.get("total_reps", 1)))
+        hold_dur = float(mode.params.get("hold_time_s", 2.0))
+        rest_dur = float(mode.params.get("rest_time_s", 2.0))
+
+        if mode.sub_phase == "go":
+            self.motion_status.set(
+                f"FOLLOW — move with the yellow ball  |  rep {mode.rep+1}/{total}")
+        elif mode.sub_phase == "hold":
+            remaining = max(0.0, hold_dur - mode.hold_t)
+            self.motion_status.set(
+                f"FOLLOW — hold at end {remaining:.1f}s  |  rep {mode.rep+1}/{total}")
+        elif mode.sub_phase == "return":
+            self.motion_status.set(
+                f"FOLLOW — return with the yellow ball  |  rep {mode.rep+1}/{total}")
+        elif mode.sub_phase == "rest":
+            remaining = max(0.0, rest_dur - mode.rest_t)
+            self.motion_status.set(
+                f"FOLLOW — rest {remaining:.1f}s  |  rep {mode.rep+1}/{total}")
+
+        rows = self.recorder.get_rows()
+        self.rec_status_var.set(
+            f"Recording → {os.path.basename(self._csv_path)}  ({rows:,} rows)")
+        self._draw_follow_canvas(mode, wrist)
+        self.after(interval_ms, self._follow_ui_loop)
+
     def _draw_canvas_idle(self):
         c = self.canvas
         W, H = int(c["width"]), int(c["height"])
@@ -2221,8 +2778,8 @@ class ExpGUI(tk.Tk):
         cy = H // 2; margin = 40
         h  = 1 if self.handedness_var.get() == "Right" else -1
         try:
-            direction = int(self.pm_direction_var.get())
-        except ValueError:
+            direction = int(round(mode.params.get("direction", 1)))
+        except Exception:
             direction = 1
         phys   = direction * h
         target = abs(self._parse_float(self.pm_target_var, 40.0))
@@ -2253,45 +2810,47 @@ class ExpGUI(tk.Tk):
         self.rom_info_var.set(
             f"PASSIVE MOVE  |  target={target:.1f}°  speed={speed:.1f}°/s  wrist={wrist:.1f}°")
 
-    def _draw_am_canvas(self, mode, wrist):
+    def _draw_follow_canvas(self, mode, wrist):
         c = self.canvas
         W, H = int(c["width"]), int(c["height"])
         c.delete("all")
-        BOUND = WRIST_LIMIT_DEG; r_flex = -BOUND; span = 2 * BOUND
-        cy = H // 2; margin = 40
-        h  = 1 if self.handedness_var.get() == "Right" else -1
-        try:
-            direction = int(self.am_direction_var.get())
-        except ValueError:
-            direction = 1
-        phys   = direction * h
-        target = abs(self._parse_float(self.am_target_var, 30.0))
-        speed  = self._parse_float(self.am_speed_var, 20.0)
+        BOUND = WRIST_LIMIT_DEG
+        r_flex = -BOUND
+        span = 2 * BOUND
+        cy = H // 2
+        margin = 40
+        h = 1 if self.handedness_var.get() == "Right" else -1
+        direction = self._get_direction()
+        phys = direction * h
+        target = abs(self._parse_float(self.follow_target_var, 30.0))
+        speed = self._parse_float(self.follow_speed_var, 20.0)
+
         def _x(deg):
             return margin + (deg - r_flex) / span * (W - 2 * margin)
+
         c.create_line(margin, cy, W - margin, cy, fill="#444", width=3)
         for deg, label in [(-BOUND, f"-{BOUND:.0f}°"), (0, "0°"), (BOUND, f"+{BOUND:.0f}°")]:
             x = _x(deg)
             c.create_line(x, cy-12, x, cy+12, fill="#555", width=2)
             c.create_text(x, cy+22, text=label, fill="#555", font=("Segoe UI", 9))
-        ext_x  = W - margin if h >= 0 else margin
-        flex_x = margin     if h >= 0 else W - margin
-        c.create_text(ext_x,  cy-22, text="EXT",  fill="#00e676", font=("Segoe UI", 8, "bold"))
+        ext_x = W - margin if h >= 0 else margin
+        flex_x = margin if h >= 0 else W - margin
+        c.create_text(ext_x, cy-22, text="EXT", fill="#00e676", font=("Segoe UI", 8, "bold"))
         c.create_text(flex_x, cy-22, text="FLEX", fill="#ff9800", font=("Segoe UI", 8, "bold"))
         tx = _x(max(-BOUND, min(BOUND, phys * target)))
-        c.create_line(tx, cy-55, tx, cy+55, fill="#888", width=1, dash=(4, 4))
-        c.create_text(tx, cy-65, text=f"T={target:.1f}°", fill="#888", font=("Segoe UI", 8))
+        c.create_line(tx, cy-55, tx, cy+55, fill="#ffd700", width=2, dash=(6, 4))
+        c.create_text(tx, cy-65, text=f"T={target:.1f}°", fill="#ffd700", font=("Segoe UI", 8))
         gx = _x(max(-BOUND, min(BOUND, mode.green_pos)))
-        c.create_oval(gx-16, cy-16, gx+16, cy+16, fill="#00e676", outline="#00c853", width=3)
+        c.create_oval(gx-16, cy-16, gx+16, cy+16, fill="#ffd700", outline="#f9a825", width=3)
         rx = _x(max(-BOUND, min(BOUND, wrist)))
         c.create_oval(rx-13, cy-13, rx+13, cy+13, fill="#ff1744", outline="#d50000", width=3)
-        colors = {"idle": "#aaa", "guide": "#00e676", "hit": "#ffd700", "return": "#ffeb3b"}
+        colors = {"go": "#00e676", "hold": "#90caf9", "return": "#ffeb3b", "rest": "#888888", "done": "#888888"}
         col = colors.get(mode.sub_phase, "#aaa")
         c.create_text(W//2, 14, text=mode.sub_phase.upper(), fill=col, font=("Segoe UI", 11, "bold"))
         c.create_text(W//2, H - 10, text=f"guide speed: {speed:.1f} wrist°/s",
                       fill="#888", font=("Segoe UI", 8))
         self.rom_info_var.set(
-            f"ACTIVE MOVE  |  target={target:.1f}°  guide={mode.green_pos:.1f}°  wrist={wrist:.1f}°")
+            f"FOLLOW  |  target={target:.1f}°  guide={mode.green_pos:.1f}°  wrist={wrist:.1f}°")
 
     # def _draw_bf_canvas(self, mode, wrist):
     #     c = self.canvas
@@ -2357,20 +2916,23 @@ class ExpGUI(tk.Tk):
         channel   = self.rah_channel_var.get()
         limit     = max(0.01, self._parse_float(self.rah_limit_var, 10.0))
         direction = self._get_direction()
-        h         = 1 if self.handedness_var.get() == "Right" else -1
-        phys_dir  = direction * h
-        upward    = phys_dir > 0
+        hand_sign = 1 if self.handedness_var.get() == "Right" else -1
+        # Fx follows the anatomical direction: right extension = +Fx, left
+        # extension = -Fx. The plot itself always grows upward from zero.
+        desired_sign = hand_sign * (1 if direction >= 0 else -1) if channel in ("Fx", "Tz") \
+                       else (1 if direction >= 0 else -1)
         ML, MR, MT, MB = 50, 10, 15, 30
         PW, PH = W - ML - MR, H - MT - MB
         WIN_S  = 15.0
-        t_left  = t_elapsed - WIN_S / 2
-        t_right = t_elapsed + WIN_S / 2
+        now_frac = 1.0 / 3.0
+        t_left  = t_elapsed - WIN_S * now_frac
+        t_right = t_left + WIN_S
         def _xpx(t_abs):
             return int(ML + (t_abs - t_left) / WIN_S * PW)
-        y_zero = MT + PH if upward else MT
+        y_zero = MT + PH
         def _ypx(norm_val):
             frac = max(0.0, min(1.4, norm_val))
-            return int(y_zero - frac / 1.4 * PH) if upward else int(y_zero + frac / 1.4 * PH)
+            return int(y_zero - frac / 1.4 * PH)
         c.create_rectangle(ML, MT, ML + PW, MT + PH, fill="#0d1117", outline="#1e2a3a")
         c.create_line(ML, y_zero, ML + PW, y_zero, fill="#2a3a4a", width=2)
         unit = "Nm" if channel.startswith("T") else "N"
@@ -2430,7 +2992,7 @@ class ExpGUI(tk.Tk):
             if channel in ("Fnorm", "Tnorm"):
                 norm_val = abs(raw_val) / limit
             else:
-                norm_val = max(0.0, raw_val * phys_dir / limit)
+                norm_val = max(0.0, raw_val * desired_sign / limit)
             self._rah_history.append((t_elapsed, norm_val))
             if len(self._rah_history) > self._RAH_HISTORY_MAXLEN:
                 self._rah_history.pop(0)
@@ -2594,7 +3156,7 @@ class ExpGUI(tk.Tk):
             "=" * 44,
         ]
         try:
-            with open(self._udp_log_path, "a", encoding="utf-8") as f:
+            with open(self._log_path, "a", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
         except Exception:
             pass
@@ -2606,6 +3168,7 @@ class ExpGUI(tk.Tk):
         self._motion_polling = False
         try:
             self.recorder.stop()
+            self._stop_session_recording()
         except Exception:
             pass
         try:
@@ -2624,7 +3187,22 @@ class ExpGUI(tk.Tk):
             self.lc_worker.disconnect()
         except Exception:
             pass
-        self.udp.close()
+        try:
+            self.trigger_worker.disconnect()
+        except Exception:
+            pass
+        try:
+            self.obs_worker.disconnect()
+        except Exception:
+            pass
+        try:
+            self.gopro_worker.disconnect()
+        except Exception:
+            pass
+        try:
+            self.udp.close()
+        except Exception:
+            pass
         self.destroy()
 
 

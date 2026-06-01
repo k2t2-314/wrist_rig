@@ -2,7 +2,6 @@ import threading
 import time
 
 import serial
-from pylsl import local_clock
 
 from hardware.ring_buffer import InterpRingBuffer
 from config import LC_BAUD, LC_COM_PORT, LC_SCALE_FACTORS, LC_SER_TIMEOUT
@@ -15,7 +14,7 @@ class LCWorker:
 
     Usage:
         worker = LCWorker()
-        worker.connect("COM3", on_success=..., on_error=...)
+        worker.connect("COM4", on_success=..., on_error=...)
         worker.disconnect()
     """
 
@@ -52,14 +51,15 @@ class LCWorker:
 
         time.sleep(1.0)
 
-        # Tare (bias capture)
+        # Tare (bias capture — average over 20 valid samples)
         try:
             self.ser.write(b"CD R\rQS\r")
             time.sleep(1.5)
             self.ser.reset_input_buffer()
             orig = self.ser.timeout
             self.ser.timeout = 2.0
-            for _ in range(20):
+            bias_samples = []
+            for _ in range(100):
                 line  = self.ser.readline().decode("utf-8", errors="ignore").strip()
                 parts = [p.strip() for p in line.split(",")]
                 if len(parts) < 7:
@@ -68,10 +68,16 @@ class LCWorker:
                     vals = [float(x) for x in parts[:7]]
                     if vals[0] != 0:
                         continue
-                    self.bias = vals[:7]
-                    break
+                    bias_samples.append(vals)
+                    if len(bias_samples) >= 20:
+                        break
                 except ValueError:
                     continue
+            if bias_samples:
+                self.bias = [
+                    sum(s[i] for s in bias_samples) / len(bias_samples)
+                    for i in range(7)
+                ]
             self.ser.timeout = orig
         except Exception:
             pass
@@ -90,7 +96,7 @@ class LCWorker:
                 continue
             parsed = self._parse(raw)
             if parsed is not None:
-                self.ring.append(local_clock(), parsed)
+                self.ring.append(time.perf_counter(), parsed)
 
     def _parse(self, line: str):
         if (not line) or line.startswith(">"):

@@ -2,8 +2,6 @@ import csv
 import math
 import threading
 import time
-
-from pylsl import local_clock
 from config import GEAR_RATIO
 
 
@@ -15,7 +13,7 @@ def _quat_to_imu(qw: float, qx: float, qy: float, qz: float) -> float:
 
 class BaseCsvRecorder:
     HEADER = [
-        "t",
+        "t_rel",
         "lc_fx", "lc_fy", "lc_fz", "lc_tx", "lc_ty", "lc_tz",
         "imu_deg", "wrist_deg", "current_mA",
         "guide_pos_deg",
@@ -55,7 +53,7 @@ class BaseCsvRecorder:
         if self.recording:
             return
         self._mode_ref = mode
-        self._t0       = local_clock()
+        self._t0       = time.perf_counter()
         self._rows     = 0
         self._marker   = 0
         self._fp       = open(filepath, "w", newline="", encoding="utf-8")
@@ -131,8 +129,6 @@ class BaseCsvRecorder:
             return []
 
     def _build_row(self, ts: float, s: list) -> list:
-        t_rel = ts - self._t0
-
         # wrist + IMU
         if s and len(s) >= 7:
             wrist_deg = (s[6] - self._get_wrist_zero()) / GEAR_RATIO
@@ -153,7 +149,7 @@ class BaseCsvRecorder:
             if (mode and hasattr(mode, "green_pos")) else ""
 
         return [
-            f"{t_rel:.6f}",
+            f"{ts:.6f}",
             *lc_row,
             imu_str, wrist_str, current_str,
             guide_str,
@@ -172,4 +168,3 @@ class BaseCsvRecorder:
             pass
         return [""] * 6
     
-

@@ -20,6 +20,11 @@ uint16_t cur_hz = 100;
 uint16_t ang_hz = 100;
 uint16_t dec_hz = 200;
 
+// ====== I2C config ======
+constexpr uint8_t INA219_ADDR = 0x40;
+constexpr unsigned long I2C_RETRY_MS = 1000;
+constexpr unsigned long I2C_RECOVERY_COOLDOWN_MS = 100;
+
 // ====== cached values ======
 float current_mA = 0;
 float wrist_deg  = 0;
@@ -28,13 +33,107 @@ long  dec_count  = 0;
 // Quaternion from BNO055 NDOF fusion
 float imu_qw = 1.0f, imu_qx = 0.0f, imu_qy = 0.0f, imu_qz = 0.0f;
 bool  imu_ok  = false;
+bool  ina_ok  = false;
 
 // ====== timers ======
 unsigned long t_last_out = 0, t_last_cur = 0, t_last_ang = 0, t_last_dec = 0;
+unsigned long t_last_i2c_retry = 0;
+unsigned long t_last_i2c_recover = 0;
+
+void reset_imu_cache() {
+  imu_qw = 1.0f;
+  imu_qx = 0.0f;
+  imu_qy = 0.0f;
+  imu_qz = 0.0f;
+}
+
+void reset_current_cache() {
+  current_mA = 0.0f;
+}
+
+void configure_wire() {
+  Wire.begin();
+  Wire.setClock(100000);
+  Wire.setTimeout(5);
+}
+
+bool wire_timed_out() {
+#if defined(WIRE_HAS_TIMEOUT)
+  if (Wire.getWireTimeoutFlag()) {
+    Wire.clearWireTimeoutFlag();
+    return true;
+  }
+#endif
+  return false;
+}
+
+bool i2c_ping(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+bool init_ina219(bool verbose = true) {
+  ina_ok = ina219.begin();
+  if (ina_ok) {
+    ina219.setCalibration_32V_2A();
+    if (verbose) {
+      Serial.println("INA219 OK");
+    }
+  } else {
+    reset_current_cache();
+    if (verbose) {
+      Serial.println("Error: INA219 not found");
+    }
+  }
+  return ina_ok;
+}
+
+bool init_bno055(bool verbose = true) {
+  imu_ok = bno.begin();
+  if (imu_ok) {
+    bno.setExtCrystalUse(true);
+    if (verbose) {
+      Serial.println("BNO055 OK");
+    }
+  } else {
+    reset_imu_cache();
+    if (verbose) {
+      Serial.println("Error: BNO055 not found — streaming qw=1,qx=0,qy=0,qz=0");
+    }
+  }
+  return imu_ok;
+}
+
+void recover_i2c_bus(const char* reason) {
+  const unsigned long now = millis();
+  if ((now - t_last_i2c_recover) < I2C_RECOVERY_COOLDOWN_MS) {
+    return;
+  }
+  t_last_i2c_recover = now;
+  Serial.print("I2C recover: ");
+  Serial.println(reason);
+  configure_wire();
+}
+
+void retry_i2c_devices() {
+  const unsigned long now = millis();
+  if ((now - t_last_i2c_retry) < I2C_RETRY_MS) {
+    return;
+  }
+  t_last_i2c_retry = now;
+
+  if (!ina_ok) {
+    init_ina219();
+  }
+  if (!imu_ok) {
+    init_bno055();
+  }
+}
 
 // ── IMU helper ───────────────────────────────────────────────────────────────
 void imu_update() {
   if (!imu_ok) return;
+
   imu::Quaternion q = bno.getQuat();
   imu_qw = (float)q.w();
   imu_qx = (float)q.x();
@@ -57,23 +156,13 @@ void setup() {
   dxl.setOperatingMode(WRIST_ID, OP_EXTENDED_POSITION);
   dxl.torqueOn(WRIST_ID);
 
-  Wire.begin();
-  Wire.setTimeout(3000);  // 3ms timeout
-  Wire.setWireTimeout(3000, true); 
+  configure_wire();
 
   // INA219
-  if (!ina219.begin()) {
-    Serial.println("Error: INA219 not found");
-  }
-  ina219.setCalibration_32V_2A();
+  init_ina219();
 
   // BNO055 (NDOF fusion mode — provides calibrated quaternion)
-  if (bno.begin()) {
-    imu_ok = true;
-    bno.setExtCrystalUse(true);   // use external 32.768 kHz crystal for accuracy
-  } else {
-    Serial.println("Error: BNO055 not found — streaming qw=1,qx=0,qy=0,qz=0");
-  }
+  init_bno055();
 
   Serial.setTimeout(5);
 }
@@ -110,13 +199,28 @@ void loop() {
     }
   }
 
+  retry_i2c_devices();
+
   // // ---- IMU update (polled every loop for maximum freshness) ----
   // imu_update();
 
   // ---- current update ----
   if (cur_hz > 0 && (now - t_last_cur) >= (1000UL / cur_hz)) {
     t_last_cur = now;
-    current_mA = ina219.getCurrent_mA();
+    if (ina_ok) {
+      if (!i2c_ping(INA219_ADDR)) {
+        ina_ok = false;
+        reset_current_cache();
+        recover_i2c_bus("INA219 ping failed");
+      } else {
+        current_mA = ina219.getCurrent_mA();
+        if (wire_timed_out()) {
+          ina_ok = false;
+          reset_current_cache();
+          recover_i2c_bus("INA219 read timeout");
+        }
+      }
+    }
   }
 
   // ---- motor angle update ----
