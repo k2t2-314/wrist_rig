@@ -1,2 +1,17 @@
-data/
+# Python runtime caches and local environments
 __pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+
+# Experiment outputs (keep source templates and SDK resources)
+/serial_manager/recordings/
+/serial_manager/GUI_logs/
+/tmsi_manager/recordings/
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
