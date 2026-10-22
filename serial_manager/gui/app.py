@@ -38,6 +38,10 @@ from tkinter import ttk, messagebox
 PRIMARY_CSV_RECORDING_ENABLED = False
 RAH_DISPLAY_HOLD_LOWPASS_HZ = 1.0
 RAH_DISPLAY_OTHER_LOWPASS_HZ = 1.0
+# RAH input is a fraction of MVC, not percentage points or raw force units.
+RAH_DISPLAY_MIN_CUTOFF_HZ = 1.0
+RAH_DISPLAY_BETA = 10.0
+RAH_DISPLAY_DERIVATIVE_CUTOFF_HZ = 1.0
 GUI_LOG_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, "GUI_logs"))
 GUI_LOG_TEMPLATE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "run_sheet_template.xlsx"))
 
@@ -53,9 +57,11 @@ from motions import (
 from recording.recorder import BaseCsvRecorder
 from recording.raw_sync_recorder import RawSyncRecorder
 from recording.trigger_timing_recorder import TriggerTimingRecorder
+from recording.rah_score_store import RAHScoreStore
 from hardware.vicon_worker import send_vicon_udp
 
 from gui.display import DisplayWindow
+from gui.one_euro import OneEuroFilter
 
 
 MANUAL_VELOCITY_DIRECTION_SIGN = WRIST_VELOCITY_COMMAND_SIGN
@@ -175,6 +181,11 @@ class ExpGUI(tk.Tk):
         self.rah_profile_schedule_var = tk.StringVar(value='(0,0),(5,0),(10,10),(20,10),(25,0),(30,0)')
         self.rah_perturbation_schedule_var = tk.StringVar(value='')
         self.rah_phase_var = tk.StringVar(value='-')
+        self.rah_player_id_var = tk.StringVar(value='')
+        self.rah_score_status_var = tk.StringVar(value='Score: --')
+        self.rah_score_store = RAHScoreStore()
+        self._rah_score_run = None
+        self._rah_mode_ref = None
         self._rah_t0 = None
         self.dr_rest_time_var = tk.StringVar(value='5.0')
         self.dr_instruction_time_var = tk.StringVar(value='5.0')
@@ -226,6 +237,10 @@ class ExpGUI(tk.Tk):
         self._recording_health_logged = False
         self._rah_display_lowpass_active = bool(self.rah_display_lowpass_var.get())
         self._rah_display_lowpass_locked = False
+        self._rah_display_filter = OneEuroFilter(
+            min_cutoff_hz=RAH_DISPLAY_MIN_CUTOFF_HZ, beta=RAH_DISPLAY_BETA,
+            derivative_cutoff_hz=RAH_DISPLAY_DERIVATIVE_CUTOFF_HZ)
+        self._rah_display_values = {}
         self._gui_session_log_path = ''
         self._gui_session_log_file = None
         self._gui_session_log_lock = threading.Lock()
@@ -446,7 +461,7 @@ class ExpGUI(tk.Tk):
         self.rah_frm = ttk.LabelFrame(right, text='RAH_LC Monitor')
         self.rah_monitor_controls = ttk.Frame(self.rah_frm)
         self.rah_monitor_controls.pack(fill='x', padx=6, pady=(6, 0))
-        self.rah_display_lowpass_check = ttk.Checkbutton(self.rah_monitor_controls, text=f'Display low-pass ({RAH_DISPLAY_HOLD_LOWPASS_HZ:g} Hz)', variable=self.rah_display_lowpass_var)
+        self.rah_display_lowpass_check = ttk.Checkbutton(self.rah_monitor_controls, text='Display smoothing (One Euro)', variable=self.rah_display_lowpass_var)
         self.rah_display_lowpass_check.pack(side='left')
         self.rah_canvas = tk.Canvas(self.rah_frm, width=460, height=340, bg='#0d1117', highlightthickness=1, highlightbackground='#333')
         self.rah_canvas.pack(fill='both', expand=True, padx=6, pady=6)
@@ -543,6 +558,13 @@ class ExpGUI(tk.Tk):
         frm.columnconfigure(3, weight=1)
         frm2 = ttk.LabelFrame(parent, text='Experiment Control')
         frm2.pack(anchor='w', **pad)
+        player_row = ttk.Frame(frm2)
+        player_row.pack(fill='x', padx=6, pady=(6, 2))
+        ttk.Label(player_row, text='Player ID:').pack(side='left', padx=(0, 6))
+        self.rah_player_id_entry = ttk.Entry(player_row, textvariable=self.rah_player_id_var, width=24)
+        self.rah_player_id_entry.pack(side='left', padx=(0, 8))
+        ttk.Button(player_row, text='View Scores', command=self._show_rah_scores).pack(side='left')
+        ttk.Label(frm2, text='Optional ID; only your best complete run is kept. 1 coin = 1 point.').pack(anchor='w', padx=10, pady=(2, 2))
         r1 = ttk.Frame(frm2)
         r1.pack(fill='x', padx=6, pady=(6, 2))
         self.rah_btn_start = ttk.Button(r1, text='  Start', command=self.rah_on_start, width=14, state='disabled')
@@ -550,6 +572,7 @@ class ExpGUI(tk.Tk):
         self.rah_btn_stop = ttk.Button(r1, text='  Stop', command=self.rah_on_stop, state='disabled', width=14)
         self.rah_btn_stop.pack(side='left')
         ttk.Label(frm2, textvariable=self.rah_phase_var, font=('Segoe UI', 9, 'bold'), foreground='#ffd700').pack(anchor='w', padx=10, pady=(4, 8))
+        ttk.Label(frm2, textvariable=self.rah_score_status_var, foreground='#167d3f').pack(anchor='w', padx=10, pady=(0, 8))
         preview_frame = ttk.LabelFrame(parent, text='Schedule Preview')
         preview_frame.pack(fill='both', expand=True, **pad)
         self.rah_schedule_canvas = tk.Canvas(preview_frame, width=760, height=280, bg='#0d1117', highlightthickness=1, highlightbackground='#333')
@@ -2483,6 +2506,9 @@ class ExpGUI(tk.Tk):
         is_rah = tab_text in ('RAH_LC',)
         is_dr_force = tab_text == 'Direction reversal' and (not bool(self.dr_dynamics_enabled_var.get()))
         if is_rah or is_dr_force:
+            smoothing_label = (f'Display low-pass ({RAH_DISPLAY_HOLD_LOWPASS_HZ:g} Hz)'
+                               if is_dr_force else 'Display smoothing (One Euro)')
+            self.rah_display_lowpass_check.config(text=smoothing_label)
             self.fx_frm.pack_forget()
             self.motion_frm.pack_forget()
             monitor_title = f'{tab_text} Monitor' if is_rah else 'Direction Reversal Force Monitor'
@@ -2631,24 +2657,28 @@ class ExpGUI(tk.Tk):
         )
 
     def _require_trigger_connection(self):
+        """Confirm each start when the trigger device is missing or unverified."""
         if self._trigger_ready():
             return True
-        messagebox.showerror(
-            "Error",
-            "Connect verified Trigger Arduino first (READY,2 + PING/PONG).",
+        return messagebox.askyesno(
+            "Start without Trigger Arduino?",
+            "Trigger Arduino is not connected or has not completed verification.\n\n"
+            "The experiment can run, but it will have no verified Arduino trigger "
+            "synchronization for TMSi/Vicon.\n\n"
+            "Start this experiment anyway?",
+            icon="warning",
+            default=messagebox.NO,
+            parent=self,
         )
-        return False
 
     def _require_experiment_connections(self):
-        if not self._require_trigger_connection():
-            return False
         if not self.serial_worker.connected:
             messagebox.showerror("Error", "Connect Exo Serial first.")
             return False
         if not self.lc_worker.connected:
             messagebox.showerror("Error", "Connect Load Cell first.")
             return False
-        return True
+        return self._require_trigger_connection()
 
 
     def _optional_hardware_log_fields(self):
@@ -3916,6 +3946,8 @@ class ExpGUI(tk.Tk):
         if error:
             messagebox.showerror("Invalid velocity test", error)
             return
+        if not self._require_trigger_connection():
+            return
         final_event = events[-1]
         total_duration = (
             VelocityTestMode.FIRST_EVENT_DELAY_S
@@ -4064,8 +4096,65 @@ class ExpGUI(tk.Tk):
         self.after(interval_ms, self._velocity_test_ui_loop)
 
 
+    def _begin_rah_score_run(self, mode, player_id, duration):
+        game = self.display._rah_game
+        trial_key = (id(mode), self._rah_t0)
+        game.begin_trial(trial_key)
+        self._rah_score_run = {
+            'player_id': player_id,
+            'trial_key': trial_key,
+            'total': game.total_coins(duration),
+            'finalized': False,
+        }
+        self.rah_score_status_var.set('Score: running...' if player_id else 'Score: no Player ID; this run will not be saved.')
+
+    def _finish_rah_score_run(self, completed):
+        run = self._rah_score_run
+        if run is None or run['finalized']:
+            return
+        run['finalized'] = True
+        if not completed:
+            self.rah_score_status_var.set('Score not saved: RAH stopped before completion.')
+            return
+        if not run['player_id']:
+            self.rah_score_status_var.set('Score not saved: no Player ID.')
+            return
+        try:
+            game = self.display._rah_game
+            if game.trial_key != run['trial_key']:
+                raise ValueError('The collected coins do not belong to this RAH run.')
+            collected = sum(1 for second in game.collected if 1 <= second <= run['total'])
+            record = self.rah_score_store.append(run['player_id'], collected, run['total'])
+        except (OSError, ValueError) as exc:
+            self.rah_score_status_var.set('Score not saved: file write failed.')
+            messagebox.showerror('RAH score not saved', f'Could not save the completed score to:\n{self.rah_score_store.path}\n\n{exc}', parent=self)
+            return
+        best_text = f'{record.line()} ({record.percent:.1f}%)'
+        if (record.collected, record.total) == (collected, run['total']):
+            self.rah_score_status_var.set(f'Best saved: {best_text}')
+        else:
+            self.rah_score_status_var.set(f'Run: {collected}/{run["total"]}, {collected} points | Best kept: {best_text}')
+
+    def _show_rah_scores(self):
+        player_id = self.rah_player_id_var.get().strip()
+        try:
+            records = self.rah_score_store.read(player_id=player_id or None)
+        except (OSError, UnicodeError) as exc:
+            messagebox.showerror('RAH scores unavailable', str(exc), parent=self)
+            return
+        if not records:
+            messagebox.showinfo('RAH Scores', 'No completed scores found for this Player ID.' if player_id else 'No completed RAH scores yet.', parent=self)
+            return
+        lines = ['Player ID | Collected/Total | Best score', ''] + [record.line() for record in records[-20:]]
+        lines += ['', 'Showing up to 20 personal bests.', str(self.rah_score_store.path)]
+        messagebox.showinfo('RAH Scores', '\n'.join(lines), parent=self)
+
     def rah_on_start(self):
         if not self._require_experiment_connections():
+            return
+        player_id = self.rah_player_id_var.get().strip()
+        if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in player_id):
+            messagebox.showerror('Invalid Player ID', 'Player ID must not contain spaces, tabs, or line breaks.', parent=self)
             return
         (config, error) = self._rah_schedule_config()
         if error:
@@ -4107,13 +4196,14 @@ class ExpGUI(tk.Tk):
         stem = self._trial_prefixed_stem(f"{'RAH'}_{hand_str}_{dir_str}_{ts}")
         self._make_file_paths('ramp_and_hold', stem)
         self._set_vicon_capture_default(vicon_base)
-        self._write_log_header({'experiment': experiment_name, 'direction': self._direction_choice_to_label(direction_choice), 'mvc_value': f'{mvc_value:.6f}', 'lc_channel': channel, 'profile_schedule_time_pct_mvc': profile_schedule_log, 'max_target_pct_mvc': f'{target_pct:.6f}', 'total_reps': total_reps, 'perturbation_enabled': int(hold_step_active), 'perturbation_schedule_time_direction_velocity_angle': perturbation_schedule_log, 'perturbation_count': hold_step_count, 'display_lowpass_enabled': int(self._rah_display_lowpass_active), 'display_lowpass_hold_cutoff_hz': f'{RAH_DISPLAY_HOLD_LOWPASS_HZ:.6f}', 'display_lowpass_other_cutoff_hz': f'{RAH_DISPLAY_OTHER_LOWPASS_HZ:.6f}', 'total_duration_s': f'{total_duration:.6f}'})
+        self._write_log_header({'experiment': experiment_name, 'direction': self._direction_choice_to_label(direction_choice), 'mvc_value': f'{mvc_value:.6f}', 'lc_channel': channel, 'profile_schedule_time_pct_mvc': profile_schedule_log, 'max_target_pct_mvc': f'{target_pct:.6f}', 'total_reps': total_reps, 'perturbation_enabled': int(hold_step_active), 'perturbation_schedule_time_direction_velocity_angle': perturbation_schedule_log, 'perturbation_count': hold_step_count, 'display_lowpass_enabled': int(self._rah_display_lowpass_active), 'display_filter': 'one_euro' if self._rah_display_lowpass_active else 'off', 'display_min_cutoff_hz': f'{self._rah_display_filter.min_cutoff_hz:.6f}', 'display_beta': f'{self._rah_display_filter.beta:.6f}', 'display_derivative_cutoff_hz': f'{self._rah_display_filter.derivative_cutoff_hz:.6f}', 'display_max_gap_s': f'{self._rah_display_filter.max_gap_s:.6f}', 'display_input_unit': 'fraction_of_MVC', 'display_timestamp_source': 'LC_host_monotonic_seconds', 'total_duration_s': f'{total_duration:.6f}'})
         self._write_rah_perturbation_table(experiment_name=experiment_name, display_name=display_name, direction=direction, direction_choice=direction_choice, hold_step_active=hold_step_active, profile_schedule=profile_schedule_log, perturbation_schedule=perturbation_schedule_log, custom_events=perturbation_events)
         start_btn = self.rah_btn_start
         stop_btn = self.rah_btn_stop
         phase_var = self.rah_phase_var
         start_btn.config(state='disabled')
         stop_btn.config(state='disabled')
+        self.rah_player_id_entry.config(state='disabled')
         self.motion_status.set(f'{display_name} - starting in 3...')
 
         def _launch():
@@ -4131,7 +4221,9 @@ class ExpGUI(tk.Tk):
             self._rah_t0 = time.time()
             self._rah_start_wrist_deg = wrist_now
             self._rah_history = []
+            self._reset_rah_display_filter()
             self._rah_mode_ref = mode
+            self._begin_rah_score_run(mode, player_id, total_duration)
             self.serial_worker.send('ZERO_VEL')
             self.serial_worker.send('MODE_EXT')
             self.serial_worker.send('TORQUE_ON')
@@ -4148,6 +4240,10 @@ class ExpGUI(tk.Tk):
 
 
     def rah_on_stop(self, auto_complete: bool = False):
+        mode = self._rah_mode_ref
+        if mode is None:
+            return
+        completed = bool(getattr(mode, 'done', False))
         self._motion_polling = False
         prev_marker = int(getattr(self.recorder, "current_marker", 0) or 0)
         if prev_marker != 0:
@@ -4155,6 +4251,7 @@ class ExpGUI(tk.Tk):
         self.recorder.set_marker(0)
         rows = self._stop_primary_csv()
         self._rah_finish_stop(rows)
+        self._finish_rah_score_run(completed)
 
     def _rah_finish_stop(self, rows: int):
         self._unlock_rah_display_lowpass()
@@ -4171,8 +4268,10 @@ class ExpGUI(tk.Tk):
         self.rec_status_var.set(self._session_record_status('Saved', rows))
         self.rah_btn_start.config(state='normal' if self._rah_diagram_ready() else 'disabled')
         self.rah_btn_stop.config(state='disabled')
+        self.rah_player_id_entry.config(state='normal')
         self._draw_rah_canvas_idle()
         self._rah_start_wrist_deg = None
+        self._rah_mode_ref = None
         self._trial_increment()
 
 
@@ -4188,12 +4287,12 @@ class ExpGUI(tk.Tk):
             if prev_marker not in (0, 4):
                 self.recorder.set_marker(4)
                 self._emit_marker(prev_marker, 4)
-            self.after(100, lambda : self.rah_on_stop(auto_complete=True))
+            self.after(100, lambda: self.rah_on_stop(auto_complete=True) if self._rah_mode_ref is mode else None)
             return
         self._update_rah_phase_marker(mode)
-        (lc_sample, _) = self.lc_worker.ring.get_latest()
+        (lc_sample, sample_ts) = self.lc_worker.ring.get_latest()
         t_elapsed = time.time() - self._rah_t0 if self._rah_t0 else 0.0
-        self._draw_rah_live(lc_sample, t_elapsed)
+        self._draw_rah_live(lc_sample, t_elapsed, sample_ts=sample_ts)
         rows = self._primary_csv_rows()
         total_reps = int(round(float(mode.params.get('total_reps', 3))))
         total_duration = mode.total_duration() if hasattr(mode, 'total_duration') else 0.0
@@ -4535,6 +4634,21 @@ class ExpGUI(tk.Tk):
         c.create_text(W // 2, H // 2, text="Press Start to begin",
                       fill="#334", font=("Segoe UI", 10))
 
+    def _reset_rah_display_filter(self):
+        self._rah_display_filter.reset()
+        self._rah_display_values.clear()
+
+    def _record_rah_display_value(self, elapsed, value, sample_ts):
+        # Process each sample once; both canvases only read this display cache.
+        filtered = value
+        if self._rah_display_lowpass_enabled():
+            try:
+                timestamp = time.perf_counter() if sample_ts is None else sample_ts
+                filtered = self._rah_display_filter.update(value, timestamp)
+            except (ValueError, OverflowError):
+                self._rah_display_filter.reset()
+        self._rah_display_values[elapsed] = filtered
+
     def _lock_rah_display_lowpass(self):
         self._rah_display_lowpass_active = bool(self.rah_display_lowpass_var.get())
         self._rah_display_lowpass_locked = True
@@ -4589,9 +4703,12 @@ class ExpGUI(tk.Tk):
     def _smooth_history_for_display(self, history):
         if not self._rah_display_lowpass_enabled():
             return history
+        mode = self.motion_runner.active_mode
+        if mode is not None and getattr(mode, 'name', '') == 'ramp_and_hold':
+            # Never re-filter at redraw time, including after the view scrolls.
+            return [(t_s, self._rah_display_values.get(t_s, value)) for t_s, value in history]
         if len(history) < 3:
             return history
-        mode = self.motion_runner.active_mode
         smoothed = []
         prev_t = float(history[0][0])
         y = float(history[0][1])
@@ -4626,7 +4743,7 @@ class ExpGUI(tk.Tk):
             return -hand_sign * direction_sign
         return direction_sign
 
-    def _draw_rah_live(self, lc_sample, t_elapsed):
+    def _draw_rah_live(self, lc_sample, t_elapsed, sample_ts=None):
         c = self.rah_canvas
         (W, H) = self._rah_canvas_size()
         c.delete('all')
@@ -4670,8 +4787,11 @@ class ExpGUI(tk.Tk):
             else:
                 norm_val = max(0.0, raw_val * desired_sign / mvc_value)
             self._rah_history.append((t_elapsed, norm_val))
+            if mode is not None and getattr(mode, 'name', '') == 'ramp_and_hold':
+                self._record_rah_display_value(t_elapsed, norm_val, sample_ts)
             if len(self._rah_history) > self._RAH_HISTORY_MAXLEN:
-                self._rah_history.pop(0)
+                expired_t, _value = self._rah_history.pop(0)
+                self._rah_display_values.pop(expired_t, None)
         visible_history = [(t_s, nv) for (t_s, nv) in self._rah_history if t_left <= t_s <= t_right]
         if is_dr_force:
             (y_axis_min, y_axis_max) = (-1.0, 1.0)
@@ -4927,6 +5047,7 @@ class ExpGUI(tk.Tk):
             self._close_gui_session_log()
         except Exception:
             pass
+        self._finish_rah_score_run(bool(getattr(self._rah_mode_ref, 'done', False)))
         self.destroy()
 
 

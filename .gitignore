@@ -15,3 +15,6 @@ __pycache__/
 .idea/
 .DS_Store
 Thumbs.db
+/serial_manager/rah_scores.txt
+/serial_manager/leaderboard.png
+/serial_manager/.rah_scores.txt.*.tmp

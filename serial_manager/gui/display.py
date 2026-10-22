@@ -7,6 +7,7 @@ import time
 import collections
 
 import tkinter as tk
+from gui.rah_game import RAHCoinGame
 from config import WRIST_LIMIT_DEG, GEAR_RATIO, WRIST_ENCODER_SIGN
 from config import DISPLAY_SMOOTHING_MS
 
@@ -27,6 +28,7 @@ class DisplayWindow(tk.Toplevel):
         self._lc_monitor_trial_key = None
         self._counting_down = False
         self._build_ui()
+        self._rah_game = RAHCoinGame(self._ball_canvas)
         self._poll()
 
     # ==========================================================================
@@ -130,6 +132,9 @@ class DisplayWindow(tk.Toplevel):
         elapsed = max(0.0, time.perf_counter() - p.recorder.t0) \
             if p.recorder.recording else 0.0
 
+        if mode is not None and mode.name == "ramp_and_hold":
+            elapsed = max(0.0, time.time() - p._rah_t0) if p._rah_t0 else 0.0
+
         rep_text = "Rep --"
         if mode is not None:
             try:
@@ -216,7 +221,7 @@ class DisplayWindow(tk.Toplevel):
                 instr = 'Complete'
                 color = '#888888'
         elif name == 'ramp_and_hold':
-            instr = 'Follow the blue line'
+            instr = 'Collect the coins'
             color = '#40c4ff'
         elif name == 'rest':
             instr = 'Rest'
@@ -299,7 +304,7 @@ class DisplayWindow(tk.Toplevel):
             self._lc_monitor_scale_max = 20.0
             self._lc_monitor_trial_key = None
             self._last_monitor_context = context
-        titles = {'rest': '', 'mvc_lc': 'LC Monitor', 'rah_lc': 'RAH_LC Monitor'}
+        titles = {'rest': '', 'mvc_lc': 'LC Monitor', 'rah_lc': 'RAH - Robot Coin Run'}
         self._monitor_title_var.set(titles.get(context, 'Motion Guide'))
 
     # ==========================================================================
@@ -422,6 +427,10 @@ class DisplayWindow(tk.Toplevel):
         self._info_lbl.config(text="Waiting for experiment")
 
     def _smooth_history_for_display(self, history):
+        mode = getattr(self.parent.motion_runner, 'active_mode', None)
+        if (mode is not None and getattr(mode, 'name', '') == 'ramp_and_hold'
+                and hasattr(self.parent, '_smooth_history_for_display')):
+            return self.parent._smooth_history_for_display(history)
         try:
             if hasattr(self.parent, "_rah_display_lowpass_enabled") and not self.parent._rah_display_lowpass_enabled():
                 return history
@@ -699,10 +708,11 @@ class DisplayWindow(tk.Toplevel):
 
     def _draw_rah(self, lc_sample, t_elapsed, p):
         c = self._ball_canvas
-        c.delete('all')
+        mode = p.motion_runner.active_mode
+        game_mode = mode is not None and getattr(mode, 'name', '') == 'ramp_and_hold'
+        c.delete('!rah_game' if game_mode else 'all')
         W = c.winfo_width() or 560
         H = c.winfo_height() or 200
-        mode = p.motion_runner.active_mode
         is_dr_force = mode is not None and getattr(mode, 'name', '') == 'direction_reversal' and hasattr(mode, 'dynamics_enabled') and (not mode.dynamics_enabled())
         if is_dr_force:
             channel = str(mode.params.get('feedback_channel', 'Fx') or 'Fx')
@@ -721,8 +731,8 @@ class DisplayWindow(tk.Toplevel):
             target_pct = max(0.0 if custom_profile else 0.01, target_pct)
             target_value = mvc_value * target_pct / 100.0
             target_norm = max(0.0 if custom_profile else 0.01, target_value / mvc_value)
-        (ML, MR, MT, MB) = (50, 10, 15, 30)
-        (PW, PH) = (W - ML - MR, H - MT - MB)
+        (ML, MR, MT, MB) = (50, 18, 42, 36) if game_mode else (50, 10, 15, 30)
+        (PW, PH) = (max(1, W - ML - MR), max(1, H - MT - MB))
         WIN_S = 15.0
         now_frac = 1.0 / 3.0
         t_left = t_elapsed - WIN_S * now_frac
@@ -737,21 +747,24 @@ class DisplayWindow(tk.Toplevel):
                 max_target_norm = max(max_target_norm, max(mode.target_pct_values(), default=0.0) / 100.0)
             (y_axis_min, y_axis_max) = (0.0, max(0.01, max_target_norm * 1.25))
         y_axis_span = y_axis_max - y_axis_min
+        sprite_pad = min(38, PH * 0.25) if game_mode else 0
 
         def _xpx(t_abs):
             return int(ML + (t_abs - t_left) / WIN_S * PW)
 
         def _ypx(norm_val):
             value = max(y_axis_min, min(y_axis_max, norm_val))
-            return int(MT + (y_axis_max - value) / y_axis_span * PH)
+            return int(MT + sprite_pad + (y_axis_max - value) / y_axis_span * (PH - 2 * sprite_pad))
         y_zero = _ypx(0.0)
         c.create_rectangle(ML, MT, ML + PW, MT + PH, fill='#0d1117', outline='#1e2a3a')
-        c.create_line(ML, y_zero, ML + PW, y_zero, fill='#2a3a4a', width=2)
+        if not game_mode:
+            c.create_line(ML, y_zero, ML + PW, y_zero, fill='#2a3a4a', width=2)
         unit = '% MVC' if is_dr_force else 'Nmm' if channel.startswith('T') else 'N'
         ticks = [-1.0, -0.5, 0.0, 0.5, 1.0] if is_dr_force else [y_axis_max * i / 4.0 for i in range(1, 5)]
         for tick in ticks:
             yg = _ypx(tick)
-            c.create_line(ML, yg, ML + PW, yg, fill='#1a2535', width=1)
+            if not game_mode:
+                c.create_line(ML, yg, ML + PW, yg, fill='#1a2535', width=1)
             tick_label = '0%' if is_dr_force and abs(tick) < 1e-09 else f'{tick * 100:+.0f}%' if is_dr_force else f'{tick * mvc_value:.1f}'
             c.create_text(ML - 4, yg, text=tick_label, anchor='e', fill='#445566', font=('Segoe UI', 7))
         c.create_text(12, MT + PH // 2, text=f'{channel}\n{unit}', fill='#445566', font=('Segoe UI', 8), angle=90)
@@ -781,7 +794,8 @@ class DisplayWindow(tk.Toplevel):
             prof_coords.extend([_xpx(t_s), _ypx(_profile_y(t_s))])
             t_s += 0.25
         if len(prof_coords) >= 4:
-            c.create_line(*prof_coords, fill='#40c4ff', width=5, dash=(8, 4))
+            c.create_line(*prof_coords, fill='#8aadb9' if game_mode else '#40c4ff',
+                          width=1 if game_mode else 5, dash=(5, 5) if game_mode else (8, 4))
         if not custom_profile:
             cycle_n = int(t_left // CYCLE)
             while True:
@@ -793,9 +807,10 @@ class DisplayWindow(tk.Toplevel):
                     c.create_line(xb, MT, xb, MT + PH, fill='#1e4a8a', width=1, dash=(4, 6))
                 cycle_n += 1
         x_now = _xpx(t_elapsed)
-        c.create_line(x_now, MT, x_now, MT + PH, fill='#aaa', width=2)
+        if not game_mode:
+            c.create_line(x_now, MT, x_now, MT + PH, fill='#aaa', width=2)
         draw_history = self._smooth_history_for_display(visible_history)
-        if len(draw_history) >= 2:
+        if not game_mode and len(draw_history) >= 2:
             coords = []
             for (t_s, nv) in draw_history:
                 x = _xpx(t_s)
@@ -810,13 +825,31 @@ class DisplayWindow(tk.Toplevel):
                     lc_col = '#ff4444' if last_nv > target_norm else '#00e676'
                 c.create_line(*coords, fill=lc_col, width=2, smooth=True, splinesteps=12)
                 c.create_oval(coords[-2] - 5, coords[-1] - 5, coords[-2] + 5, coords[-1] + 5, fill=lc_col, outline='white', width=1)
+        if game_mode:
+            current_norm = float(draw_history[-1][1]) if draw_history else None
+            _latest, sample_ts = p.lc_worker.ring.get_latest()
+            live_data = bool(
+                lc_sample is not None and len(lc_sample) >= 6
+                and sample_ts is not None and 0.0 <= time.perf_counter() - sample_ts <= 0.5
+                and draw_history and 0.0 <= t_elapsed - draw_history[-1][0] <= 0.5
+                and current_norm is not None and _math.isfinite(current_norm)
+            )
+            self._rah_game.draw(
+                trial_key=(id(mode), p._rah_t0), elapsed=t_elapsed, duration=profile_duration,
+                t_left=t_left, t_right=t_right, x_px=_xpx, y_px=_ypx,
+                profile_y=_profile_y, current_norm=current_norm, live_data=live_data,
+                running=not getattr(mode, 'done', False), plot_height=PH, right_edge=ML + PW,
+            )
         if custom_profile or is_dr_force:
             title = f't={t_elapsed:.1f}s/{profile_duration:.1f}s  |  {mode.sub_phase}'
         else:
             phase_s = t_elapsed % CYCLE
             cycle_n2 = int(t_elapsed // CYCLE) + 1
             title = f't={t_elapsed:.1f}s  |  trial {min(cycle_n2, total_reps)}/{total_reps}  |  phase {phase_s:.1f}s/{CYCLE:.1f}s'
-        c.create_text(W // 2, 8, text=title, fill='#aaa', font=('Segoe UI', 9, 'bold'))
+        if game_mode:
+            c.create_text(ML, 17, text=title, anchor='w', fill='#9baabb', font=('Segoe UI', 9))
+        else:
+            c.create_text(W // 2, 8, text=title, fill='#aaa', font=('Segoe UI', 9, 'bold'))
         self._info_lbl.config(text='')
 
     # ==========================================================================
