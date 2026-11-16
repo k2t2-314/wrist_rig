@@ -7,7 +7,10 @@ import time
 import collections
 
 import tkinter as tk
+from PIL import ImageTk
+from gui import sprites, themes
 from gui.rah_game import RAHCoinGame
+from leaderboard import render_leaderboard
 from config import WRIST_LIMIT_DEG, GEAR_RATIO, WRIST_ENCODER_SIGN
 from config import DISPLAY_SMOOTHING_MS
 
@@ -27,8 +30,19 @@ class DisplayWindow(tk.Toplevel):
         self._lc_monitor_scale_max = 20.0
         self._lc_monitor_trial_key = None
         self._counting_down = False
+        # Leaderboard overlay (shown after a completed RAH run until the next start).
+        self._leaderboard = None
+        self._leaderboard_photo = None
+        self._leaderboard_size = None
+        self._leaderboard_drawn = False
+        self._leaderboard_resize_after_id = None
         self._build_ui()
         self._rah_game = RAHCoinGame(self._ball_canvas)
+        self._ball_canvas.bind('<Configure>', self._on_ball_canvas_configure)
+        self.bind('<Escape>', lambda _event: self.hide_leaderboard())
+        # Closing this window only hides it (the GUI's "Show" button brings it back): destroying
+        # it would break every later countdown and leaderboard call from the operator GUI.
+        self.protocol('WM_DELETE_WINDOW', self.withdraw)
         self._poll()
 
     # ==========================================================================
@@ -42,6 +56,9 @@ class DisplayWindow(tk.Toplevel):
         # -- Top row: wrist angle + instruction -------------------------------
         top = tk.Frame(self, bg="#0d1117")
         top.grid(row=0, column=0, sticky="ew", padx=20, pady=(20, 8))
+        self._top_frm = top
+        self._top_row_visible = True
+        self._countdown_text = ''
         top.columnconfigure(0, minsize=520)
         top.columnconfigure(1, weight=1)
 
@@ -81,14 +98,17 @@ class DisplayWindow(tk.Toplevel):
         # -- Bottom row: force bar (left) + motion guide (right) --------------
         bottom_frm = tk.Frame(self, bg="#0d1117")
         bottom_frm.grid(row=1, column=0, sticky="nsew", padx=20, pady=(8, 20))
+        self._bottom_frm = bottom_frm
+        self._force_bar_visible = True
         bottom_frm.columnconfigure(0, minsize=140, weight=0)  # bar: fixed width
         bottom_frm.columnconfigure(1, weight=1)              # ball: rest
         bottom_frm.rowconfigure(1, weight=1)
 
         # -- Force bar ---------------------------------------------------------
-        tk.Label(bottom_frm, text="Force",
-                 bg="#0d1117", fg="#888888",
-                 font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w")
+        self._force_label = tk.Label(bottom_frm, text="Force",
+                                     bg="#0d1117", fg="#888888",
+                                     font=("Segoe UI", 10))
+        self._force_label.grid(row=0, column=0, sticky="w")
         self._bar_canvas = tk.Canvas(bottom_frm, bg="#0d1117", width=140,
                                      highlightthickness=1,
                                      highlightbackground="#1e2a3a")
@@ -96,9 +116,10 @@ class DisplayWindow(tk.Toplevel):
 
         # -- Experiment monitor / motion guide --------------------------------
         self._monitor_title_var = tk.StringVar(value="Motion Guide")
-        tk.Label(bottom_frm, textvariable=self._monitor_title_var,
-                 bg="#0d1117", fg="#888888",
-                 font=("Segoe UI", 12)).grid(row=0, column=1, sticky="w")
+        self._monitor_title_lbl = tk.Label(bottom_frm, textvariable=self._monitor_title_var,
+                                           bg="#0d1117", fg="#888888",
+                                           font=("Segoe UI", 12))
+        self._monitor_title_lbl.grid(row=0, column=1, sticky="w")
         self._ball_canvas = tk.Canvas(bottom_frm, bg="#1a1a2e",
                                       highlightthickness=1,
                                       highlightbackground="#444")
@@ -127,6 +148,8 @@ class DisplayWindow(tk.Toplevel):
         self.after(interval_ms, self._poll)
 
     def _update_angle(self):
+        if not self._top_row_visible:
+            return
         p = self.parent
         mode = p.motion_runner.active_mode
         elapsed = max(0.0, time.perf_counter() - p.recorder.t0) \
@@ -134,6 +157,8 @@ class DisplayWindow(tk.Toplevel):
 
         if mode is not None and mode.name == "ramp_and_hold":
             elapsed = max(0.0, time.time() - p._rah_t0) if p._rah_t0 else 0.0
+        if mode is not None and mode.name == "rah_practice":
+            elapsed = max(0.0, time.time() - p._practice_t0) if getattr(p, "_practice_t0", None) else 0.0
 
         rep_text = "Rep --"
         if mode is not None:
@@ -146,12 +171,14 @@ class DisplayWindow(tk.Toplevel):
             except Exception:
                 rep_text = "Rep --"
 
+        if mode is not None and mode.name == "rah_practice":
+            rep_text = "Practice"
         is_mvc = self._display_context(mode) == "mvc_lc"
         self._angle_heading_lbl.config(text="Rep" if is_mvc else "Rep / Time")
         self._angle_lbl.config(text=rep_text if is_mvc else f"{rep_text}    T {elapsed:5.1f}s")
 
     def _update_instruction(self):
-        if self._counting_down:
+        if not self._top_row_visible or self._counting_down:
             return
         p = self.parent
         if getattr(p, '_mvc_running', False):
@@ -160,6 +187,12 @@ class DisplayWindow(tk.Toplevel):
             self._force_alert_lbl.config(text='')
             return
         mode = p.motion_runner.active_mode
+        if self._leaderboard is not None and (mode is None or getattr(mode, 'done', False)):
+            finished = self._leaderboard.get('last_run') is not None
+            self._instr_lbl.config(text='Run complete!' if finished else 'Leaderboard', fg='#ffd700')
+            self._timer_lbl.config(text='')
+            self._force_alert_lbl.config(text='')
+            return
         if mode is None:
             self._instr_lbl.config(text='—', fg='#888888')
             self._timer_lbl.config(text='')
@@ -221,7 +254,10 @@ class DisplayWindow(tk.Toplevel):
                 instr = 'Complete'
                 color = '#888888'
         elif name == 'ramp_and_hold':
-            instr = 'Collect the coins'
+            instr = themes.active()['instruction']
+            color = '#40c4ff'
+        elif name == 'rah_practice':
+            instr = 'Practice: reach the top'
             color = '#40c4ff'
         elif name == 'rest':
             instr = 'Rest'
@@ -236,6 +272,22 @@ class DisplayWindow(tk.Toplevel):
         mode = p.motion_runner.active_mode
         context = self._display_context(mode)
         self._set_monitor_context(context)
+        # The force bar and the rep/instruction row distract from the game: both are hidden
+        # for RAH (game, practice and idle); the countdown is drawn on the game area instead.
+        # The EMG-only maximal effort shows only its cues: no force bar, no rep row (no force feedback).
+        self._set_force_bar_visible(context not in ('rah_lc', 'mvc_emg'))
+        self._set_top_row_visible(context not in ('rah_lc', 'mvc_emg'))
+        self._apply_rah_theme(context == 'rah_lc')
+        if context == 'mvc_emg':
+            self._draw_mvc_emg(p)
+            return
+        if self._counting_down and context == 'rah_lc':
+            self._draw_countdown()
+            return
+        if self._leaderboard is not None:
+            self._monitor_title_var.set('Leaderboard')
+            self._draw_leaderboard()
+            return
         if context == 'mvc_lc':
             (lc_sample, _) = p.lc_worker.ring.get_latest()
             self._draw_lc_monitor(lc_sample, p, role='mvc_lc')
@@ -245,12 +297,16 @@ class DisplayWindow(tk.Toplevel):
             return
         self._ball_canvas.configure(bg='#1a1a2e')
         if context in ('rah_lc',):
+            if mode is not None and getattr(mode, 'name', '') == 'rah_practice':
+                self._monitor_title_var.set('Practice (not recorded)')
+                self._draw_practice(p)
+                return
             if mode is not None and (mode.name == 'ramp_and_hold' or hasattr(mode, 'profile_fraction')):
                 (lc_sample, _) = p.lc_worker.ring.get_latest()
                 t_elapsed = time.time() - p._rah_t0 if p._rah_t0 else 0.0
                 self._draw_rah(lc_sample, t_elapsed, p)
             else:
-                self._draw_monitor_idle('RAH_LC Monitor')
+                self._draw_monitor_idle('')
             return
         if mode is None:
             self._draw_ball_idle()
@@ -286,16 +342,20 @@ class DisplayWindow(tk.Toplevel):
         except Exception:
             pass
         mode_name = mode.name if mode is not None else ''
+        # A running task decides the context; the selected tab only matters while nothing runs,
+        # so switching tabs in the operator GUI during a run never swaps the participant's view.
+        if mode_name in ('ramp_and_hold', 'rah_practice'):
+            return 'rah_lc'
+        if mode_name in ('passive_movement', 'follow', 'direction_reversal'):
+            return 'motion'
+        if getattr(p, '_mvc_emg_running', False) or getattr(p, '_mvc_emg_countdown_active', False) or tab_text == 'MVC_EMG':
+            return 'mvc_emg'
         if getattr(p, '_mvc_running', False) or tab_text == 'MVC_LC':
             return 'mvc_lc'
-        if mode_name == 'ramp_and_hold' or tab_text in ('RAH_LC',):
+        if tab_text in ('RAH_LC',):
             return 'rah_lc'
         if getattr(p, '_rest_running', False) or tab_text == 'Rest':
             return 'rest'
-        if tab_text in ('Passive Movement', 'Voluntary Movement'):
-            return 'motion'
-        if mode_name in ('passive_movement', 'follow', 'direction_reversal'):
-            return 'motion'
         return 'motion'
 
     def _set_monitor_context(self, context: str):
@@ -304,21 +364,24 @@ class DisplayWindow(tk.Toplevel):
             self._lc_monitor_scale_max = 20.0
             self._lc_monitor_trial_key = None
             self._last_monitor_context = context
-        titles = {'rest': '', 'mvc_lc': 'LC Monitor', 'rah_lc': 'RAH - Robot Coin Run'}
+        titles = {'rest': '', 'mvc_lc': 'LC Monitor', 'rah_lc': '', 'mvc_emg': ''}
         self._monitor_title_var.set(titles.get(context, 'Motion Guide'))
 
     # ==========================================================================
     #  LC helpers (still needed for force alert)
     # ==========================================================================
+    # (index, signed, unit); Fxy = sqrt(Fx^2 + Fy^2), unsigned like Fnorm and Tnorm.
     _LC_CHANNELS = {
         "Fx":    (0, True,  "N"),  "Fy":    (1, True,  "N"),  "Fz":    (2, True,  "N"),
         "Tx":    (3, True,  "Nmm"), "Ty":    (4, True,  "Nmm"), "Tz":    (5, True,  "Nmm"),
-        "Fnorm": (None, False, "N"), "Tnorm": (None, False, "Nmm"),
+        "Fnorm": (None, False, "N"), "Tnorm": (None, False, "Nmm"), "Fxy": (None, False, "N"),
     }
 
     def _lc_value(self, sample, channel: str) -> float:
         if channel == "Fnorm":
             return _math.sqrt(sum(sample[i]**2 for i in range(3)))
+        if channel == "Fxy":
+            return _math.hypot(sample[0], sample[1])
         if channel == "Tnorm":
             return _math.sqrt(sum(sample[i]**2 for i in range(3, 6)))
         return sample[self._LC_CHANNELS[channel][0]]
@@ -326,7 +389,113 @@ class DisplayWindow(tk.Toplevel):
     # ==========================================================================
     #  Force bar
     # ==========================================================================
+    def on_theme_changed(self):
+        """The game theme was switched in the operator GUI: drop cached chrome and images."""
+        self._theme_bg = None
+        self._leaderboard_photo = None
+        self._leaderboard_drawn = False
+        try:
+            self._rah_game.prewarm(self._ball_canvas.winfo_width() or 560, self._ball_canvas.winfo_height() or 200)
+        except Exception:
+            pass
+
+    def _draw_backdrop(self, c, W, H, ML, MT, PW, PH):
+        """Theme backdrop on a canvas that is cleared every frame (countdown, practice): the
+        background picture, if the theme has one, and the static star field, if it has stars."""
+        backdrop = sprites.background_image(W, H)
+        if backdrop is not None:
+            c.create_image(0, 0, anchor='nw', image=sprites.photo(backdrop, c))
+        for (sx, sy, r, colour) in sprites.star_field(PW, PH):
+            x, y = ML + sx, MT + sy
+            c.create_oval(x - r, y - r, x + r, y + r, fill=colour, outline='')
+
+    def _apply_rah_theme(self, active: bool):
+        """Window chrome in the game theme's palette during RAH, the original dark grey otherwise."""
+        colour = sprites.BACKGROUND if active else '#0d1117'
+        if getattr(self, '_theme_bg', None) == colour:
+            return
+        self._theme_bg = colour
+        for widget in (self, self._bottom_frm, self._info_lbl, self._monitor_title_lbl):
+            widget.configure(bg=colour)
+        self._monitor_title_lbl.configure(fg=sprites.hex_colour(sprites.THEME['text_dim']) if active else '#888888')
+        self._info_lbl.configure(fg=sprites.hex_colour(sprites.THEME['text_dim']) if active else '#555555')
+        self._ball_canvas.configure(highlightbackground=sprites.FRAME if active else '#444')
+
+    def _set_top_row_visible(self, visible: bool):
+        if self._top_row_visible == bool(visible):
+            return
+        self._top_row_visible = bool(visible)
+        if visible:
+            self._top_frm.grid()
+        else:
+            self._top_frm.grid_remove()
+
+    def _draw_countdown(self):
+        """'Get ready 3 2 1 GO!' on the game area while the top row is hidden."""
+        c = self._ball_canvas
+        c.configure(bg=sprites.BACKGROUND)
+        c.delete('all')
+        W = c.winfo_width() or 560
+        H = c.winfo_height() or 200
+        text = self._countdown_text
+        self._draw_backdrop(c, W, H, *RAHCoinGame.plot_box(W, H))
+        c.create_text(W // 2, H // 2 - 90, text='GET READY', fill=sprites.hex_colour(sprites.THEME['countdown']),
+                      font=sprites.FONT_COUNTDOWN_LABEL)
+        if text:
+            colour = sprites.THEME['go'] if text == 'GO!' else sprites.THEME['text']
+            c.create_text(W // 2, H // 2 + 30, text=text, fill=sprites.hex_colour(colour), font=sprites.FONT_COUNTDOWN)
+        self._info_lbl.config(text='')
+
+    def _draw_mvc_emg(self, p):
+        """Cues of the EMG-only maximal-effort trial: REST / MAX EFFORT! / RELAX with the seconds left,
+        drawn large on the game area (the top row and the force bar are hidden)."""
+        if self._counting_down:
+            self._draw_countdown()
+            return
+        c = self._ball_canvas
+        W = c.winfo_width() or 560
+        H = c.winfo_height() or 200
+        phase = getattr(p, '_mvc_emg_phase', '')
+        end = getattr(p, '_mvc_emg_phase_end_perf', None)
+        remaining = max(0.0, end - time.perf_counter()) if end else 0.0
+        secs = int(_math.ceil(remaining))
+        params = getattr(p, '_mvc_emg_params', {}) or {}
+        n = int(params.get('n', 0) or 0)
+        i = int(getattr(p, '_mvc_emg_effort_index', 0)) + 1
+        running = bool(getattr(p, '_mvc_emg_running', False))
+        text_colour = sprites.hex_colour(sprites.THEME['text'])
+        if running and phase == 'max':
+            bg, big, colour, sub = '#3a0d0d', 'MAX EFFORT!', '#ff5252', f'{secs} s'
+        elif running and phase == 'rest':
+            bg, big, colour, sub = sprites.BACKGROUND, 'REST', '#9e9e9e', f'max effort in {secs} s'
+        elif running and phase == 'recover':
+            bg, big, colour, sub = sprites.BACKGROUND, 'RELAX', '#4fc3f7', f'next effort in {secs} s'
+        else:
+            bg, big, colour, sub = sprites.BACKGROUND, 'MVC (EMG)', '#888888', 'waiting for start'
+        c.configure(bg=bg)
+        c.delete('all')
+        c.create_text(W // 2, H // 2 - 40, text=big, fill=colour, font=sprites.FONT_COUNTDOWN)
+        c.create_text(W // 2, H // 2 + 60, text=sub, fill=text_colour, font=sprites.FONT_COUNTDOWN_LABEL)
+        if running and n:
+            c.create_text(W // 2, H - 30, text=f'Effort {i} of {n}', fill='#bbbbbb', font=sprites.FONT_HUD)
+        self._info_lbl.config(text='')
+
+    def _set_force_bar_visible(self, visible: bool):
+        if self._force_bar_visible == bool(visible):
+            return
+        self._force_bar_visible = bool(visible)
+        if visible:
+            self._force_label.grid()
+            self._bar_canvas.grid()
+            self._bottom_frm.columnconfigure(0, minsize=140)
+        else:
+            self._force_label.grid_remove()
+            self._bar_canvas.grid_remove()
+            self._bottom_frm.columnconfigure(0, minsize=0)
+
     def _update_bar(self):
+        if not self._force_bar_visible:
+            return
         p    = self.parent
         mode = p.motion_runner.active_mode
         lc_sample, _ = p.lc_worker.ring.get_latest()
@@ -344,7 +513,7 @@ class DisplayWindow(tk.Toplevel):
             bar_col  = "#00e676" if not over else "#ff4444"
             norm_val = min(1.4, abs(val) / baseline if baseline > 0 else 0.0)
             mode_name = getattr(mode, "name", "") if mode is not None else ""
-            hide_mvc_reference = mode_name in ("ramp_and_hold", "direction_reversal")
+            hide_mvc_reference = mode_name in ("ramp_and_hold", "rah_practice", "direction_reversal")
             self._draw_bar(
                 norm_val,
                 bar_col,
@@ -352,7 +521,7 @@ class DisplayWindow(tk.Toplevel):
                 val,
                 unit,
                 show_baseline=not hide_mvc_reference,
-                show_value=(mode_name != "ramp_and_hold"),
+                show_value=(mode_name not in ("ramp_and_hold", "rah_practice")),
             )
         except Exception:
             self._draw_bar_empty()
@@ -709,11 +878,14 @@ class DisplayWindow(tk.Toplevel):
     def _draw_rah(self, lc_sample, t_elapsed, p):
         c = self._ball_canvas
         mode = p.motion_runner.active_mode
-        game_mode = mode is not None and getattr(mode, 'name', '') == 'ramp_and_hold'
-        c.delete('!rah_game' if game_mode else 'all')
+        if mode is not None and getattr(mode, 'name', '') == 'ramp_and_hold':
+            self._draw_game(lc_sample, t_elapsed, p, mode)
+            return
+        c.delete('all')
         W = c.winfo_width() or 560
         H = c.winfo_height() or 200
-        is_dr_force = mode is not None and getattr(mode, 'name', '') == 'direction_reversal' and hasattr(mode, 'dynamics_enabled') and (not mode.dynamics_enabled())
+        is_dr_force = (mode is not None and getattr(mode, 'name', '') == 'direction_reversal'
+                       and hasattr(mode, 'dynamics_enabled') and (not mode.dynamics_enabled()))
         if is_dr_force:
             channel = str(mode.params.get('feedback_channel', 'Fx') or 'Fx')
             mvc_value = max(0.01, float(mode.target_force_value()))
@@ -731,7 +903,7 @@ class DisplayWindow(tk.Toplevel):
             target_pct = max(0.0 if custom_profile else 0.01, target_pct)
             target_value = mvc_value * target_pct / 100.0
             target_norm = max(0.0 if custom_profile else 0.01, target_value / mvc_value)
-        (ML, MR, MT, MB) = (50, 18, 42, 36) if game_mode else (50, 10, 15, 30)
+        (ML, MR, MT, MB) = (50, 10, 15, 30)
         (PW, PH) = (max(1, W - ML - MR), max(1, H - MT - MB))
         WIN_S = 15.0
         now_frac = 1.0 / 3.0
@@ -747,24 +919,21 @@ class DisplayWindow(tk.Toplevel):
                 max_target_norm = max(max_target_norm, max(mode.target_pct_values(), default=0.0) / 100.0)
             (y_axis_min, y_axis_max) = (0.0, max(0.01, max_target_norm * 1.25))
         y_axis_span = y_axis_max - y_axis_min
-        sprite_pad = min(38, PH * 0.25) if game_mode else 0
 
         def _xpx(t_abs):
             return int(ML + (t_abs - t_left) / WIN_S * PW)
 
         def _ypx(norm_val):
             value = max(y_axis_min, min(y_axis_max, norm_val))
-            return int(MT + sprite_pad + (y_axis_max - value) / y_axis_span * (PH - 2 * sprite_pad))
+            return int(MT + (y_axis_max - value) / y_axis_span * PH)
         y_zero = _ypx(0.0)
         c.create_rectangle(ML, MT, ML + PW, MT + PH, fill='#0d1117', outline='#1e2a3a')
-        if not game_mode:
-            c.create_line(ML, y_zero, ML + PW, y_zero, fill='#2a3a4a', width=2)
+        c.create_line(ML, y_zero, ML + PW, y_zero, fill='#2a3a4a', width=2)
         unit = '% MVC' if is_dr_force else 'Nmm' if channel.startswith('T') else 'N'
         ticks = [-1.0, -0.5, 0.0, 0.5, 1.0] if is_dr_force else [y_axis_max * i / 4.0 for i in range(1, 5)]
         for tick in ticks:
             yg = _ypx(tick)
-            if not game_mode:
-                c.create_line(ML, yg, ML + PW, yg, fill='#1a2535', width=1)
+            c.create_line(ML, yg, ML + PW, yg, fill='#1a2535', width=1)
             tick_label = '0%' if is_dr_force and abs(tick) < 1e-09 else f'{tick * 100:+.0f}%' if is_dr_force else f'{tick * mvc_value:.1f}'
             c.create_text(ML - 4, yg, text=tick_label, anchor='e', fill='#445566', font=('Segoe UI', 7))
         c.create_text(12, MT + PH // 2, text=f'{channel}\n{unit}', fill='#445566', font=('Segoe UI', 8), angle=90)
@@ -794,8 +963,7 @@ class DisplayWindow(tk.Toplevel):
             prof_coords.extend([_xpx(t_s), _ypx(_profile_y(t_s))])
             t_s += 0.25
         if len(prof_coords) >= 4:
-            c.create_line(*prof_coords, fill='#8aadb9' if game_mode else '#40c4ff',
-                          width=1 if game_mode else 5, dash=(5, 5) if game_mode else (8, 4))
+            c.create_line(*prof_coords, fill='#40c4ff', width=5, dash=(8, 4))
         if not custom_profile:
             cycle_n = int(t_left // CYCLE)
             while True:
@@ -807,10 +975,9 @@ class DisplayWindow(tk.Toplevel):
                     c.create_line(xb, MT, xb, MT + PH, fill='#1e4a8a', width=1, dash=(4, 6))
                 cycle_n += 1
         x_now = _xpx(t_elapsed)
-        if not game_mode:
-            c.create_line(x_now, MT, x_now, MT + PH, fill='#aaa', width=2)
+        c.create_line(x_now, MT, x_now, MT + PH, fill='#aaa', width=2)
         draw_history = self._smooth_history_for_display(visible_history)
-        if not game_mode and len(draw_history) >= 2:
+        if len(draw_history) >= 2:
             coords = []
             for (t_s, nv) in draw_history:
                 x = _xpx(t_s)
@@ -825,42 +992,246 @@ class DisplayWindow(tk.Toplevel):
                     lc_col = '#ff4444' if last_nv > target_norm else '#00e676'
                 c.create_line(*coords, fill=lc_col, width=2, smooth=True, splinesteps=12)
                 c.create_oval(coords[-2] - 5, coords[-1] - 5, coords[-2] + 5, coords[-1] + 5, fill=lc_col, outline='white', width=1)
-        if game_mode:
-            current_norm = float(draw_history[-1][1]) if draw_history else None
-            _latest, sample_ts = p.lc_worker.ring.get_latest()
-            live_data = bool(
-                lc_sample is not None and len(lc_sample) >= 6
-                and sample_ts is not None and 0.0 <= time.perf_counter() - sample_ts <= 0.5
-                and draw_history and 0.0 <= t_elapsed - draw_history[-1][0] <= 0.5
-                and current_norm is not None and _math.isfinite(current_norm)
-            )
-            self._rah_game.draw(
-                trial_key=(id(mode), p._rah_t0), elapsed=t_elapsed, duration=profile_duration,
-                t_left=t_left, t_right=t_right, x_px=_xpx, y_px=_ypx,
-                profile_y=_profile_y, current_norm=current_norm, live_data=live_data,
-                running=not getattr(mode, 'done', False), plot_height=PH, right_edge=ML + PW,
-            )
         if custom_profile or is_dr_force:
             title = f't={t_elapsed:.1f}s/{profile_duration:.1f}s  |  {mode.sub_phase}'
         else:
             phase_s = t_elapsed % CYCLE
             cycle_n2 = int(t_elapsed // CYCLE) + 1
             title = f't={t_elapsed:.1f}s  |  trial {min(cycle_n2, total_reps)}/{total_reps}  |  phase {phase_s:.1f}s/{CYCLE:.1f}s'
-        if game_mode:
-            c.create_text(ML, 17, text=title, anchor='w', fill='#9baabb', font=('Segoe UI', 9))
-        else:
-            c.create_text(W // 2, 8, text=title, fill='#aaa', font=('Segoe UI', 9, 'bold'))
+        c.create_text(W // 2, 8, text=title, fill='#aaa', font=('Segoe UI', 9, 'bold'))
         self._info_lbl.config(text='')
+
+    def _draw_game(self, lc_sample, t_elapsed, p, mode):
+        """The bean game of a ramp-and-hold run; RAHCoinGame draws everything on the canvas.
+
+        The plot spans NEGATIVE_AXIS_FRACTION of the peak below zero so that rest sits
+        visibly on the baseline. A bean is collected when any part of the character touches
+        it (see RAHCoinGame); ``pickup_tolerance`` says what that is in force units here.
+        """
+        c = self._ball_canvas
+        c.configure(bg=sprites.BACKGROUND)
+        c.delete('!rah_game')
+        W = c.winfo_width() or 560
+        H = c.winfo_height() or 200
+        mvc_value = max(0.01, p._parse_float(p.rah_limit_var, 10.0))
+        peak_norm = max(mode.target_pct_values(), default=0.0) / 100.0 if hasattr(mode, 'target_pct_values') else 0.1
+        (axis_min, axis_max) = RAHCoinGame.axis_range(peak_norm)
+        (ML, MT, PW, PH) = RAHCoinGame.plot_box(W, H)
+        WIN_S = RAHCoinGame.WINDOW_S
+        t_left = t_elapsed - WIN_S / 3.0
+        t_right = t_left + WIN_S
+        sprite_pad = RAHCoinGame.sprite_pad(PH)
+
+        def _xpx(t_abs):
+            return ML + (t_abs - t_left) / WIN_S * PW
+
+        def _ypx(norm_val):
+            value = max(axis_min, min(axis_max, norm_val))
+            return MT + sprite_pad + (axis_max - value) / (axis_max - axis_min) * (PH - 2 * sprite_pad)
+        profile_duration = float(mode.total_duration()) if hasattr(mode, 'total_duration') else 0.0
+
+        def _profile_y(t_abs):
+            if t_abs < 0 or t_abs > profile_duration:
+                return 0.0
+            return max(0.0, float(mode.profile_value(t_abs)) / mvc_value)
+        update_history = getattr(p, '_update_rah_history', None)
+        if update_history is not None:
+            # Every LC sample up to this frame (each at its own trial time), so the character
+            # and the bean verdicts never use a sample that is up to one GUI tick old.
+            update_history()
+        history = getattr(p, '_rah_history', []) or []
+        visible_history = [(t_s, nv) for (t_s, nv) in history if t_left <= t_s <= t_right]
+        draw_history = self._smooth_history_for_display(visible_history)
+        current_norm = float(draw_history[-1][1]) if draw_history else None
+        _latest, sample_ts = p.lc_worker.ring.get_latest()
+        live_data = bool(
+            lc_sample is not None and len(lc_sample) >= 6
+            and sample_ts is not None and 0.0 <= time.perf_counter() - sample_ts <= 0.5
+            and draw_history and 0.0 <= t_elapsed - draw_history[-1][0] <= 0.5
+            and current_norm is not None and _math.isfinite(current_norm)
+        )
+        self._rah_game.draw(
+            trial_key=id(mode), elapsed=t_elapsed, duration=profile_duration,
+            t_left=t_left, t_right=t_right, x_px=_xpx, y_px=_ypx, profile_y=_profile_y,
+            history=draw_history, live_data=live_data, plot_box=(ML, MT, PW, PH),
+        )
+        self._info_lbl.config(text='')
+
+    def pickup_tolerance(self, mvc_value, peak_norm, ramp_slopes=()):
+        """How far the character may be above and below the line and still collect a bean, at
+        the current canvas size: (above, below, robot_px, coin_px, ramp), ``above``/``below``
+        for a hold (flat bean) in the feedback channel's units (N for forces, Nmm for torques)
+        and ``ramp`` = (above, below) for the steepest of ``ramp_slopes`` (fractions of MVC per
+        second; None when no ramps are given). It is the sprites' vertical reach
+        (sprites.touch_range for a bean lying along the line) converted with this canvas'
+        force scale for a run whose highest target is ``peak_norm`` (fraction of MVC) at
+        ``mvc_value``."""
+        c = self._ball_canvas
+        W = c.winfo_width() or 560
+        H = c.winfo_height() or 200
+        (axis_min, axis_max) = RAHCoinGame.axis_range(peak_norm)
+        plot_box = RAHCoinGame.plot_box(W, H)
+        (_ML, _MT, PW, PH) = plot_box
+        px_per_norm = (PH - 2 * RAHCoinGame.sprite_pad(PH)) / (axis_max - axis_min)
+        px_per_s = PW / RAHCoinGame.WINDOW_S
+        # The character is sized for this plot so that its touch reach is the configured zone
+        # (set_schedule must have been called for the run, as _begin_rah_score_run does).
+        robot_px = self._rah_game.robot_px_for(plot_box)
+        coin_px = RAHCoinGame.coin_px(robot_px, PW)
+        scale = float(mvc_value) / px_per_norm
+        above_px, below_px = RAHCoinGame.pickup_reach_px(robot_px, coin_px, angle=0.0)
+        ramp = None
+        for slope in ramp_slopes:
+            angle = RAHCoinGame.line_angle(slope, px_per_norm, px_per_s)
+            a, b = RAHCoinGame.pickup_reach_px(robot_px, coin_px, angle=angle)
+            ramp = (a * scale, b * scale) if ramp is None else (max(ramp[0], a * scale), max(ramp[1], b * scale))
+        return above_px * scale, below_px * scale, robot_px, coin_px, ramp
+
+    # ==========================================================================
+    #  RAH practice (unrecorded warm-up before a run)
+    # ==========================================================================
+    def _draw_practice(self, p):
+        """Unrecorded warm-up: the robot climbs with the live force; the top band is the practice % MVC.
+
+        Reads only p.practice_display_state(); nothing here records or commands anything.
+        """
+        c = self._ball_canvas
+        c.configure(bg=sprites.BACKGROUND)
+        c.delete('all')
+        W = c.winfo_width() or 560
+        H = c.winfo_height() or 200
+        state = p.practice_display_state() if hasattr(p, 'practice_display_state') else None
+        if state is None:
+            self._draw_monitor_idle('')
+            return
+        (ML, MT, PW, PH) = RAHCoinGame.plot_box(W, H)
+        WIN_S = 15.0
+        t_now = float(state['t_now'])
+        t_left = t_now - WIN_S / 3.0
+        t_right = t_left + WIN_S
+        top = max(0.01, float(state['top_pct']) / 100.0)
+        axis_min = -sprites.NEGATIVE_AXIS_FRACTION * top
+        sprite_pad = min(44, PH * 0.18)
+
+        def _xpx(t_abs):
+            return ML + (t_abs - t_left) / WIN_S * PW
+
+        def _ypx(norm_val):
+            value = max(axis_min, min(top, norm_val))
+            return MT + sprite_pad + (top - value) / (top - axis_min) * (PH - 2 * sprite_pad)
+        y_top = _ypx(top)
+        y_zero = _ypx(0.0)
+        self._draw_backdrop(c, W, H, ML, MT, PW, PH)
+        c.create_rectangle(ML, MT, ML + PW, y_top, fill=sprites.TOP_BAND_FILL, outline='')
+        c.create_rectangle(ML, y_zero, ML + PW, MT + PH, fill=sprites.NEGATIVE_FILL, outline='')
+        c.create_line(ML, y_zero, ML + PW, y_zero, fill=sprites.hex_colour(sprites.THEME['baseline']), width=2)
+        top_colour = sprites.hex_colour(sprites.THEME['top_line'])
+        c.create_line(ML, y_top, ML + PW, y_top, fill=top_colour, width=3, dash=(12, 8))
+        c.create_text(ML + PW - 12, (MT + y_top) / 2, text=f'TOP  {top * 100:g} %', anchor='e',
+                      fill=top_colour, font=sprites.FONT_TOP)
+        history = [(t_s, nv) for (t_s, nv) in state['history'] if t_left <= t_s <= t_right]
+        coords = []
+        for (t_s, nv) in history:
+            coords.extend([_xpx(t_s), _ypx(nv)])
+        if len(coords) >= 4:
+            c.create_line(*coords, fill=sprites.hex_colour(sprites.THEME['trail']), width=2, smooth=True, splinesteps=8)
+        current = history[-1][1] if history else None
+        robot_px = RAHCoinGame.robot_height(PH)
+        # Lowest mood until the top has been reached once, then the brightest.
+        mood = 4 if state.get('top_hits', 0) else 1
+        robot = sprites.photo(sprites.robot_image(robot_px, mood), c)
+        if current is not None:
+            dx, dy = sprites.robot_anchor(robot_px, mood)   # body centre on the force value
+            c.create_image(_xpx(t_now) - dx, _ypx(current) - dy, image=robot)
+        else:
+            c.create_text(_xpx(t_now), MT + 18, text='Waiting for live LC data',
+                          fill=sprites.hex_colour(sprites.THEME['text_dim']), font=('Segoe UI', 10))
+        c.create_text(ML + 4, 17, text='PRACTICE', anchor='w', fill=sprites.hex_colour(sprites.THEME['text_dim']),
+                      font=sprites.FONT_LABEL)
+        c.create_text(ML + PW - 6, 17, text=f'TOP REACHED  {int(state.get("top_hits", 0))}', anchor='e',
+                      fill=sprites.hex_colour(sprites.THEME['text']), font=sprites.FONT_HUD)
+        self._info_lbl.config(text='')
+
+    # ==========================================================================
+    #  Leaderboard overlay
+    # ==========================================================================
+    def show_leaderboard(self, records, highlight=None, last_run=None):
+        """Overlay the standings on the game area until the next run starts or it is hidden.
+
+        ``records`` are RAHScore personal bests, ``highlight`` the Player ID to mark as
+        YOU and ``last_run`` the dictionary about the run that just finished (or None
+        when the operator asks for the board outside a run).
+        """
+        self._leaderboard = {'records': list(records), 'highlight': highlight, 'last_run': last_run}
+        self._leaderboard_photo = None
+        self._leaderboard_size = None
+        self._leaderboard_drawn = False
+        self._draw_leaderboard()
+
+    def hide_leaderboard(self):
+        if self._leaderboard is None:
+            return
+        self._leaderboard = None
+        self._leaderboard_photo = None
+        self._leaderboard_drawn = False
+        self._ball_canvas.delete('all')
+        self._info_lbl.config(text='')
+
+    @property
+    def leaderboard_visible(self) -> bool:
+        return self._leaderboard is not None
+
+    def _on_ball_canvas_configure(self, _event=None):
+        if self._leaderboard is None:
+            return
+        if self._leaderboard_resize_after_id is not None:
+            self.after_cancel(self._leaderboard_resize_after_id)
+        self._leaderboard_resize_after_id = self.after(150, self._redraw_leaderboard_after_resize)
+
+    def _redraw_leaderboard_after_resize(self):
+        self._leaderboard_resize_after_id = None
+        if self._leaderboard is not None:
+            self._leaderboard_drawn = False
+            self._draw_leaderboard()
+
+    def _draw_leaderboard(self):
+        info = self._leaderboard
+        if info is None:
+            return
+        c = self._ball_canvas
+        W, H = int(c.winfo_width()), int(c.winfo_height())
+        if W <= 1 or H <= 1:
+            return  # not mapped yet; the poll loop tries again
+        if self._leaderboard_drawn and self._leaderboard_size == (W, H) and c.type('leaderboard'):
+            return
+        if self._leaderboard_photo is None or self._leaderboard_size != (W, H):
+            image = render_leaderboard(info['records'], limit=10, highlight=info['highlight'],
+                                       last_run=info['last_run'], size=(W, H))
+            self._leaderboard_photo = ImageTk.PhotoImage(image, master=c)
+            self._leaderboard_size = (W, H)
+        c.configure(bg=themes.active()['leaderboard']['background'])
+        c.delete('all')
+        c.create_image(0, 0, anchor='nw', image=self._leaderboard_photo, tags=('leaderboard',))
+        self._leaderboard_drawn = True
+        self._info_lbl.config(text='The leaderboard stays until the next run starts (Esc on this window hides it)')
 
     # ==========================================================================
     #  Countdown
     # ==========================================================================
     def countdown(self, callback):
+        self.hide_leaderboard()
+        # Sprites for the coming run are rendered now, not on its first frame.
+        try:
+            self._rah_game.prewarm(self._ball_canvas.winfo_width() or 560, self._ball_canvas.winfo_height() or 200)
+        except Exception:
+            pass
+        self._countdown_text = ''
         self._counting_down = True
         self._instr_lbl.config(text="Get ready", fg="#ffd700")
         self._do_countdown(3, callback)
 
     def _do_countdown(self, n, callback):
+        self._countdown_text = "GO!" if n <= 0 else str(n)
         if n <= 0:
             self._timer_lbl.config(text="GO!", fg="#ff1744")
             self.after(500, lambda: (

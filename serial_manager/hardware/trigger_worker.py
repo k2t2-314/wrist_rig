@@ -1,3 +1,4 @@
+import queue
 import threading
 import time
 
@@ -8,10 +9,21 @@ from config import TRIGGER_BAUD, TRIGGER_TIMEOUT
 UINT32_MASK = 0xFFFFFFFF
 TRIGGER_READY_LINE = "READY,2"
 TRIGGER_HANDSHAKE_TIMEOUT_S = 2.5
+# The firmware holds every pulse for 20 ms and answers BUSY to a command that arrives inside
+# it. The sender therefore spaces commands at least this long after the previous ACK and
+# retries a BUSY answer once the pulse is over, so no marker is ever lost.
+TRIGGER_PULSE_S = 0.020
+TRIGGER_MIN_GAP_S = 0.022
+TRIGGER_BUSY_RETRIES = 3
 
 
 class TriggerWorker:
-    """Serial sender for the timestamped TMSi/Vicon trigger Arduino."""
+    """Serial sender for the timestamped TMSi/Vicon trigger Arduino.
+
+    Asynchronous commands go through one persistent sender thread fed by a queue, so a
+    marker costs the caller (the 100 Hz motion thread) only a queue put. The thread writes
+    each command, waits for its ACK and runs the completion callback.
+    """
 
     def __init__(self):
         self.ser = None
@@ -27,6 +39,10 @@ class TriggerWorker:
             self._event_id = 1
         self._lock = threading.Lock()
         self._wlock = threading.Lock()
+        self._last_ack_perf = 0.0
+        self._queue = queue.Queue()
+        self._sender_thread = None
+        self._sender_lock = threading.Lock()
 
     def _next_event_id(self) -> int:
         self._event_id = (self._event_id + 1) & UINT32_MASK
@@ -50,6 +66,13 @@ class TriggerWorker:
         t_ack_ns: int,
     ):
         parts = line.split(",")
+        try:
+            return self._parse_timed_fields(parts, line, t_send_ns, t_write_done_ns, t_ack_ns)
+        except (ValueError, IndexError):
+            print(f"[TriggerArduino] bad timed response: {line}", flush=True)
+            return None
+
+    def _parse_timed_fields(self, parts, line, t_send_ns, t_write_done_ns, t_ack_ns):
         if parts[0] == "ACK" and len(parts) == 6:
             event_id = int(parts[1])
             code = int(parts[2])
@@ -122,9 +145,14 @@ class TriggerWorker:
         t_send_ns: int,
         t_write_done_ns: int,
     ):
+        """Timing dict of the ACK for ``event_id``; the string "BUSY" when the firmware refused
+        the command because a pulse was still active; None on an error or no answer."""
+        ser = self.ser
         deadline = time.perf_counter() + max(float(TRIGGER_TIMEOUT), 0.25)
         while time.perf_counter() < deadline:
-            raw = self.ser.readline()
+            if ser is None:
+                return None
+            raw = ser.readline()
             t_ack_ns = time.perf_counter_ns()
             if not raw:
                 continue
@@ -138,7 +166,7 @@ class TriggerWorker:
                     response_id = -1
                 if response_id in {0, event_id}:
                     print(f"[TriggerArduino] {line}", flush=True)
-                    return None
+                    return "BUSY" if parts[0] == "BUSY" else None
 
             if not line.startswith(prefixes):
                 continue
@@ -197,23 +225,43 @@ class TriggerWorker:
                 return True, ready_line or "PING/PONG", line
         return False, ready_line, "missing valid PONG"
 
+    def _wait_for_pulse_gap(self):
+        """Sleep until the previous pulse is certainly over, so the firmware never answers BUSY
+        to a command that follows another one closely (two phase markers in one tick)."""
+        wait = self._last_ack_perf + TRIGGER_MIN_GAP_S - time.perf_counter()
+        if wait > 0:
+            time.sleep(wait)
+
     def _send_timed_command(self, command: str, event_id: int, prefixes: tuple[str, ...]):
-        if not (self.ser and self.ser.is_open):
+        ser = self.ser
+        if not (ser and ser.is_open):
             print(f"[TriggerArduino] {command} skipped: not connected", flush=True)
             return None
 
         try:
             with self._wlock:
-                t_send_ns = time.perf_counter_ns()
-                self.ser.write(f"{command}\n".encode("ascii"))
-                self.ser.flush()
-                t_write_done_ns = time.perf_counter_ns()
-                timing = self._read_timed_response(
-                    event_id,
-                    prefixes,
-                    t_send_ns,
-                    t_write_done_ns,
-                )
+                timing = None
+                for attempt in range(TRIGGER_BUSY_RETRIES + 1):
+                    self._wait_for_pulse_gap()
+                    t_send_ns = time.perf_counter_ns()
+                    ser.write(f"{command}\n".encode("ascii"))
+                    ser.flush()
+                    t_write_done_ns = time.perf_counter_ns()
+                    timing = self._read_timed_response(
+                        event_id,
+                        prefixes,
+                        t_send_ns,
+                        t_write_done_ns,
+                    )
+                    if timing == "BUSY":
+                        # A pulse was still running on the Arduino: it ends within one pulse
+                        # width, then the same command (same event id) is sent again.
+                        self._last_ack_perf = time.perf_counter() + TRIGGER_PULSE_S - TRIGGER_MIN_GAP_S
+                        timing = None
+                        if attempt < TRIGGER_BUSY_RETRIES:
+                            print(f"[TriggerArduino] {command} busy, retry {attempt + 1}", flush=True)
+                            continue
+                    break
                 if timing is None:
                     t_ack_ns = time.perf_counter_ns()
                     timing = {
@@ -223,6 +271,8 @@ class TriggerWorker:
                         "t_ack_ns": t_ack_ns,
                         "host_round_trip_ns": t_ack_ns - t_send_ns,
                     }
+                else:
+                    self._last_ack_perf = timing["t_ack_ns"] / 1_000_000_000.0
                 timing["command"] = command
             if timing and timing.get("raw_response"):
                 print(
@@ -236,14 +286,20 @@ class TriggerWorker:
             print(f"[TriggerArduino] {command} error ({exc})", flush=True)
             return None
 
-    def _send_timed_command_async(
-        self,
-        command: str,
-        event_id: int,
-        prefixes: tuple[str, ...],
-        on_complete=None,
-    ):
-        def _run():
+    def _ensure_sender_thread(self):
+        with self._sender_lock:
+            thread = self._sender_thread
+            if thread is not None and thread.is_alive():
+                return
+            self._sender_thread = threading.Thread(target=self._sender_loop, name="trigger-sender", daemon=True)
+            self._sender_thread.start()
+
+    def _sender_loop(self):
+        while True:
+            item = self._queue.get()
+            if item is None:
+                return
+            command, event_id, prefixes, on_complete = item
             timing = self._send_timed_command(command, event_id, prefixes)
             if on_complete is not None:
                 try:
@@ -251,8 +307,16 @@ class TriggerWorker:
                 except Exception as exc:
                     print(f"[TriggerArduino] async callback error ({exc})", flush=True)
 
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
+    def _send_timed_command_async(
+        self,
+        command: str,
+        event_id: int,
+        prefixes: tuple[str, ...],
+        on_complete=None,
+    ):
+        """Queue the command for the sender thread and return at once (no thread start, no I/O)."""
+        self._ensure_sender_thread()
+        self._queue.put((command, event_id, prefixes, on_complete))
         return {
             "event_id": event_id,
             "queued": True,
@@ -304,6 +368,8 @@ class TriggerWorker:
                 self.firmware_ready = ready_line
                 self.last_pong = pong_or_error
                 self.connecting = False
+                self._last_ack_perf = 0.0
+            self._ensure_sender_thread()
             if on_success:
                 on_success()
         except Exception as exc:
@@ -361,7 +427,9 @@ class TriggerWorker:
             ser = self.ser
             self.ser = None
         if ser:
-            try:
-                ser.close()
-            except Exception:
-                pass
+            # Let a command in flight finish (its ACK wait is bounded) before the port closes.
+            with self._wlock:
+                try:
+                    ser.close()
+                except Exception:
+                    pass

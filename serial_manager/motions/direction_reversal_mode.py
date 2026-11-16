@@ -80,6 +80,10 @@ class DirectionReversalMode(ModeBase):
     def phase(self) -> str:
         return self.sub_phase
 
+    @property
+    def current_instruction(self) -> str:
+        """The cue of the current rep: "extension", "flexion" or "rest" (the GUI reads it)."""
+        return self._current_instruction
 
     def total_reps(self) -> int:
         try:
@@ -257,10 +261,12 @@ class DirectionReversalMode(ModeBase):
         phase, rep_number, phase_t = self._phase_at(elapsed)
 
         self._elapsed = elapsed
-        self.sub_phase = phase
         self._rep = max(0, min(self.total_reps() - 1, rep_number - 1))
-        self._phase_t = max(0.0, phase_t)
         self._current_instruction = self._instruction_for_rep(rep_number)
+        # Through _set_phase so on_phase_change fires at the tick of the change (the GUI emits
+        # the marker and the trigger from it), exactly as in dynamics mode.
+        self._set_phase(phase)
+        self._phase_t = max(0.0, phase_t)
 
         if phase == "done":
             self._done = True
@@ -316,7 +322,9 @@ class DirectionReversalMode(ModeBase):
         self._elapsed = elapsed
 
         try:
-            wrist = float(state.get("wrist_deg", self.hold_pos) or self.hold_pos)
+            wrist_value = state.get("wrist_deg", None)
+            # 0.0 deg is a real reading; only a missing value falls back to the hold angle.
+            wrist = self.hold_pos if wrist_value is None else float(wrist_value)
         except Exception:
             wrist = self.hold_pos
         damper = self._damper()

@@ -112,15 +112,15 @@ class MotionRunner:
 
     def stop(self, release: bool = True):
         """
-        Stop the control loop.
+        Stop the control loop. Also clears a mode that finished on its own (its loop has
+        ended, but active_mode kept pointing at it) and leaves velocity mode if it was active.
 
         Args:
             release: if True, send SET_DMP:0 to release the damper.
         """
-        if not self._running:
-            return
+        was_running = self._running
         self._stop_evt.set()
-        if self._thread:
+        if was_running and self._thread:
             self._thread.join(timeout=2.0)
         self._running = False
         self._mode    = None
@@ -128,7 +128,7 @@ class MotionRunner:
             if self._velocity_mode_active:
                 self._send_velocity_stop()
                 self._velocity_mode_active = False
-            if release:
+            if release and was_running:
                 self._send_damper(0)
 
     # ── Control loop ──────────────────────────────────────────────────────────
@@ -152,7 +152,13 @@ class MotionRunner:
 
             try:
                 cmd = mode.compute(state)
-            except Exception:
+            except Exception as exc:
+                # A mode that raises must never leave the motor running at its last velocity.
+                print(f"[MotionRunner] {getattr(mode, 'name', 'mode')} compute error: {exc!r}", flush=True)
+                if self._velocity_mode_active:
+                    self._send_velocity_stop()
+                    self._velocity_mode_active = False
+                    prev_velocity_cmd = 0.0
                 cmd = Command()
 
             velocity_cmd = getattr(cmd, "velocity", None)

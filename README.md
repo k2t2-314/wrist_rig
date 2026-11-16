@@ -63,3 +63,36 @@ Both main GUIs accept `--mock` at the end of their launch commands. TMSi mock mo
 - `serial_manager/udp_sender.py`: UDP encoding/sending module with a command-line entry point; use `--help` to view its arguments.
 
 Running the applications creates `tmsi_manager/recordings/`, `serial_manager/recordings/`, and `serial_manager/GUI_logs/` as needed. Automatic combined experiment CSV recording is disabled by default; raw recordings, trigger timing records, and the independent Start CSV/Stop CSV controls remain available. `serial_manager/gui/run_sheet_template.xlsx` is the session log template and must be retained.
+
+## MVC from EMG (tab `MVC_EMG` in the serial GUI)
+
+Estimates the maximal wrist force from EMG when the load cell cannot take a maximal effort. Package
+`serial_manager/mvc_emg/` (numpy, scipy, matplotlib from `requirements.txt`; imported only when the analysis runs).
+
+1. **Set-up.** TMSi GUI: connect both SAGAs, press Start Stream on each (the trigger input is only enabled by
+   Start Stream; a file recorded without it has a flat `TRIGGERS` channel and cannot be aligned), set the file
+   tags (flexor SAGA = `FLX`). Serial GUI, tab `MVC_EMG`: the flexor tag and the TMSi recordings folder are
+   remembered in `serial_manager/mvc_emg_settings.json`.
+2. **Maximal effort, EMG only.** Efforts (3), rest 5 s, MAX 5 s, recovery 60 s. Type the prefix shown in the
+   tab (e.g. `01_MVC_EMG_R_flex`, Copy button) as the TMSi filename prefix, Start Recording there, then Start
+   here. The participant screen shows REST / MAX EFFORT! / RELAX with a countdown; trigger codes 6 (rest),
+   7 (MAX), 8 (recovery), 15 (stop). Rig files go to `serial_manager/recordings/mvc_emg/`. The load cell is
+   recorded but not used.
+3. **Square-wave calibration.** Levels in N (default `1, 5, 20, 30`), hold 5 s, rest 10 s, ramp 0.5 s.
+   "Send to RAH tab" writes the profile into RAH_LC, sets its MVC value to 100 N (so % = N) and the channel to
+   Fx and generates the diagram; check the direction, type the RAH stem as the TMSi prefix and run it in RAH_LC.
+4. **Estimate.** Browse for the calibration Poly5 (the RAH trial's flexor file) and the MVC Poly5 (the
+   EMG-only efforts); the matching rig log is filled in from the file name or, failing that, from the closest
+   trial in time (browse to override it). Choose the force quantity (Fx by default) and the channels (`all` =
+   every channel that passes the quality rules, a number = only the best N by signal-to-noise ratio, or a fixed
+   list), press Analyse. The analysis aligns EMG and force with the TTL pulses,
+   takes the middle 3 s of every hold and the rest before it, band-passes 20-500 Hz, computes RMS in 0.5 s
+   epochs with noise correction, excludes silent/noisy/clipped/unresponsive channels, takes the median over the
+   kept channels per epoch, measures the peak EMG of each effort on the same channels in the same way,
+   fits a line, a power law and a quadratic, inverts them at the effort EMG and reports the median with the
+   spread between the models (above 25 % the result is reported as "above the top level" instead of a number).
+   Report, figure and epoch table are written next to the rig files
+   (`recordings/mvc_emg/<RAH stem>__mvc_from_emg/`); "Use as RAH MVC value" copies the estimate into RAH_LC.
+
+Command line (from `serial_manager`): `python -m mvc_emg --rah-log <RAH log> --mvc-log <MVC_EMG log> --tmsi-dir <folder> --tag FLX --out <folder>`;
+`python -m mvc_emg.selftest [file.poly5]` runs the fit on synthetic data and the Poly5 reader.

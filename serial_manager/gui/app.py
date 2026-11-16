@@ -23,6 +23,7 @@ import collections
 import csv
 import math as _math
 import os
+import queue
 import random
 import re
 import shutil
@@ -49,19 +50,25 @@ from config import (
     GEAR_RATIO, WRIST_COMMAND_SIGN, WRIST_ENCODER_SIGN, WRIST_VELOCITY_COMMAND_SIGN, DATA_ROOT,
     SERIAL_COM_PORT, LC_COM_PORT, TRIGGER_COM_PORT,
     VICON_ENABLED, VICON_HOST, VICON_PORT, VICON_BIND_HOST, VICON_DATABASE_PATH,
+    RAH_PRACTICE_TOP_PCT, RAH_LEADERBOARD_CONFIRM,
 )
 from motions import (
     RestMode, PassiveMovementMode, FollowMode,
-    RAHMode, VelocityTestMode, DirectionReversalMode, MotionRunner,
+    RAHMode, RAHPracticeMode, VelocityTestMode, DirectionReversalMode, MotionRunner,
 )
 from recording.recorder import BaseCsvRecorder
 from recording.raw_sync_recorder import RawSyncRecorder
 from recording.trigger_timing_recorder import TriggerTimingRecorder
-from recording.rah_score_store import RAHScoreStore
+from recording.rah_score_store import RAHScoreStore, STICKER_FRACTION, earns_sticker
 from hardware.vicon_worker import send_vicon_udp
 
+from gui import sprites, themes
 from gui.display import DisplayWindow
 from gui.one_euro import OneEuroFilter
+from gui.rah_game import RAHCoinGame
+from tkinter import filedialog
+from config import MVC_EMG_CODES, MVC_EMG_DEFAULTS, TMSI_RECORDINGS_DIR, MVC_EMG_SETTINGS_PATH
+from mvc_emg import rigfiles as mvc_rigfiles
 
 
 MANUAL_VELOCITY_DIRECTION_SIGN = WRIST_VELOCITY_COMMAND_SIGN
@@ -144,6 +151,48 @@ class ExpGUI(tk.Tk):
         self._mvc_duration_s = 0.0
         self._mvc_rest_angle = 0.0
         self._mvc_lc_channel = 'Fnorm'
+        # MVC_EMG tab: EMG-only maximal efforts, square-wave calibration helper, MVC-from-EMG analysis
+        _d = MVC_EMG_DEFAULTS
+        _settings = mvc_rigfiles.load_settings(MVC_EMG_SETTINGS_PATH, {'tag': _d['tag'], 'tmsi_dir': TMSI_RECORDINGS_DIR})
+        self.mvc_emg_n_efforts_var = tk.StringVar(value=str(_d['efforts']))
+        self.mvc_emg_rest_var = tk.StringVar(value=f"{_d['rest_s']:g}")
+        self.mvc_emg_effort_var = tk.StringVar(value=f"{_d['max_s']:g}")
+        self.mvc_emg_recovery_var = tk.StringVar(value=f"{_d['recovery_s']:g}")
+        self.mvc_emg_direction_var = tk.StringVar(value='flexion')
+        self.mvc_emg_phase_var = tk.StringVar(value='-')
+        self.mvc_emg_stem_var = tk.StringVar(value='')
+        self.mvc_emg_sq_levels_var = tk.StringVar(value=_d['levels_N'])
+        self.mvc_emg_sq_hold_var = tk.StringVar(value=f"{_d['hold_s']:g}")
+        self.mvc_emg_sq_rest_var = tk.StringVar(value=f"{_d['cal_rest_s']:g}")
+        self.mvc_emg_sq_ramp_var = tk.StringVar(value=f"{_d['ramp_s']:g}")
+        self.mvc_emg_sq_status_var = tk.StringVar(value='')
+        self.mvc_emg_tag_var = tk.StringVar(value=str(_settings['tag']))
+        self.mvc_emg_tmsi_dir_var = tk.StringVar(value=str(_settings['tmsi_dir']))
+        self.mvc_emg_cal_poly5_var = tk.StringVar(value='')
+        self.mvc_emg_cal_log_var = tk.StringVar(value='')
+        self.mvc_emg_mvc_poly5_var = tk.StringVar(value='')
+        self.mvc_emg_mvc_log_var = tk.StringVar(value='')
+        self.mvc_emg_force_var = tk.StringVar(value=_d['force'])
+        self.mvc_emg_nbest_var = tk.StringVar(value=('all' if int(_d['n_best']) <= 0 else str(_d['n_best'])))
+        self.mvc_emg_channels_var = tk.StringVar(value='')
+        self.mvc_emg_analysis_status_var = tk.StringVar(value='')
+        self.mvc_emg_estimate_var = tk.StringVar(value='')
+        self._mvc_emg_running = False
+        self._mvc_emg_countdown_active = False
+        self._mvc_emg_after_id = None
+        self._mvc_emg_t0 = None
+        self._mvc_emg_phases = []
+        self._mvc_emg_total_s = 0.0
+        self._mvc_emg_phase = ''
+        self._mvc_emg_phase_end_perf = None
+        self._mvc_emg_effort_index = 0
+        self._mvc_emg_params = {}
+        self._mvc_emg_rest_angle = 0.0
+        self._mvc_emg_phase_log = []
+        self._mvc_emg_gui_log_run_name = ''
+        self._mvc_emg_analysis_thread = None
+        self._mvc_emg_last_result = None
+        self._mvc_emg_fig_photo = None
         self.motion_info_var = tk.StringVar(value='-')
         self.phase_detail_var = tk.StringVar(value='-')
         self.pm_start_var = tk.StringVar(value='0.0')
@@ -184,9 +233,21 @@ class ExpGUI(tk.Tk):
         self.rah_player_id_var = tk.StringVar(value='')
         self.rah_score_status_var = tk.StringVar(value='Score: --')
         self.rah_score_store = RAHScoreStore()
+        self.rah_theme_var = tk.StringVar(value=themes.active()['title'])
         self._rah_score_run = None
         self._rah_mode_ref = None
         self._rah_t0 = None
+        self._rah_last_sample_ts = None   # LC ring timestamp of the last sample in the RAH display history
+        self._rah_display_log = []        # (trial time, raw fraction of MVC, displayed fraction) of the current run
+        # RAH practice (unrecorded warm-up): mode, clock, display history and top-hit counter.
+        self.rah_practice_top_var = tk.StringVar(value=f'{RAH_PRACTICE_TOP_PCT:g}')
+        self._practice_mode_ref = None
+        self._practice_t0 = None
+        self._practice_cfg = None
+        self._practice_history = []
+        self._practice_top_hits = 0
+        self._practice_at_top = False
+        self._practice_polling = False
         self.dr_rest_time_var = tk.StringVar(value='5.0')
         self.dr_instruction_time_var = tk.StringVar(value='5.0')
         self.dr_rise_time_var = tk.StringVar(value='5.0')
@@ -200,6 +261,7 @@ class ExpGUI(tk.Tk):
         self.dr_instruction_vars = []
         self.dr_phase_var = tk.StringVar(value='-')
         self._dr_t0 = None
+        self._dr_mode_ref = None
         self._rah_generated_config = None
         self.velocity_test_count_var = tk.StringVar(value='6')
         self.velocity_test_interval_var = tk.StringVar(value='3.0')
@@ -230,6 +292,11 @@ class ExpGUI(tk.Tk):
         self._free_record_path = ''
         self._free_record_after_id = None
         self._trigger_async_lock = threading.Lock()
+        # Serialises "read the current marker, set the new one, queue its trigger" between the
+        # motion thread (phase callbacks) and the Tk thread (stops and fallback loops).
+        self._marker_lock = threading.Lock()
+        self._rah_countdown_active = False
+        self._dr_status_text = None
         self._pending_trigger_acks = 0
         self._trigger_timing_stop_requested = False
         self._copy_to_subdir_after_trigger = False
@@ -349,6 +416,10 @@ class ExpGUI(tk.Tk):
         self.btn_trigger_disconnect = ttk.Button(trig_frm, text='Disconnect', command=self.on_trigger_disconnect, state='disabled', width=9)
         self.btn_trigger_disconnect.grid(row=0, column=3, padx=3)
         ttk.Label(trig_frm, textvariable=self.trigger_status_var, foreground='gray', font=('Segoe UI', 8), wraplength=260, justify='left').grid(row=1, column=0, columnspan=4, sticky='w', padx=5, pady=(0, 3))
+        disp_frm = ttk.LabelFrame(conn_row, text='Subject display')
+        disp_frm.grid(row=1, column=1, sticky='nw', padx=(4, 0), pady=(4, 0))
+        ttk.Button(disp_frm, text='Show', command=self._show_subject_display, width=8).grid(row=0, column=0, padx=5, pady=3)
+        ttk.Label(disp_frm, text='Closing the display window only hides it.', foreground='gray', font=('Segoe UI', 8)).grid(row=0, column=1, sticky='w', padx=(0, 5))
         frm = ttk.LabelFrame(left, text='Manual Controls')
         frm.pack(anchor='w', **pad)
         manual_common = ttk.Frame(frm)
@@ -403,6 +474,7 @@ class ExpGUI(tk.Tk):
         self.notebook.pack(fill='both', expand=True, padx=8, pady=(4, 8))
         tab_rest = self._make_scrollable_tab('  Rest  ')
         tab_mvc_lc = self._make_scrollable_tab('  MVC_LC  ')
+        tab_mvc_emg = self._make_scrollable_tab('  MVC_EMG  ')
         tab_rah = self._make_scrollable_tab('  RAH_LC  ')
         tab_velocity_test = self._make_scrollable_tab('  Test Velocity  ')
         tab_dr = self._make_scrollable_tab('  Direction reversal  ')
@@ -410,6 +482,7 @@ class ExpGUI(tk.Tk):
         tab_follow = self._make_scrollable_tab('  Voluntary Movement  ')
         self._build_rest_tab(tab_rest)
         self._build_mvc_lc_tab(tab_mvc_lc)
+        self._build_mvc_emg_tab(tab_mvc_emg)
         self._build_rah_tab(tab_rah)
         self._build_velocity_test_tab(tab_velocity_test)
         self._build_direction_reversal_tab(tab_dr)
@@ -449,7 +522,7 @@ class ExpGUI(tk.Tk):
         self.lc_monitor_controls = ttk.Frame(self.fx_frm)
         self.lc_monitor_controls.pack(fill='x', padx=6, pady=(6, 2))
         ttk.Label(self.lc_monitor_controls, text='Channel:').pack(side='left')
-        ttk.Combobox(self.lc_monitor_controls, textvariable=self.lc_channel_var, values=['Fx', 'Fy', 'Fz', 'Tx', 'Ty', 'Tz', 'Fnorm', 'Tnorm'], width=7, state='readonly').pack(side='left', padx=(4, 16))
+        ttk.Combobox(self.lc_monitor_controls, textvariable=self.lc_channel_var, values=['Fx', 'Fy', 'Fz', 'Tx', 'Ty', 'Tz', 'Fnorm', 'Tnorm', 'Fxy'], width=7, state='readonly').pack(side='left', padx=(4, 16))
         ttk.Label(self.lc_monitor_controls, text='Baseline (N or Nmm):').pack(side='left')
         ttk.Entry(self.lc_monitor_controls, textvariable=self.fx_max_var, width=8).pack(side='left', padx=6)
         ttk.Label(self.lc_monitor_controls, text='- dashed line', foreground='gray', font=('Segoe UI', 8)).pack(side='left')
@@ -505,7 +578,7 @@ class ExpGUI(tk.Tk):
         ttk.Entry(frm, textvariable=self.mvc_duration_var, width=8).grid(row=0, column=1, sticky="w", padx=4)
         ttk.Label(frm, text="LC Channel:").grid(row=0, column=2, sticky="w", padx=(16, 6), pady=5)
         ttk.Combobox(frm, textvariable=self.mvc_lc_channel_var,
-                     values=["Fx","Fy","Fz","Tx","Ty","Tz","Fnorm","Tnorm"],
+                     values=["Fx","Fy","Fz","Tx","Ty","Tz","Fnorm","Tnorm","Fxy"],
                      width=7, state="readonly").grid(row=0, column=3, sticky="w", padx=4)
         ttk.Label(frm, text="Direction:").grid(row=1, column=0, sticky="w", padx=6, pady=5)
         dir_row = ttk.Frame(frm)
@@ -537,6 +610,461 @@ class ExpGUI(tk.Tk):
                       anchor="w", padx=10, pady=(0, 8))
 
 
+    # ------------------------------------------------------------------------------ MVC_EMG tab
+    def _build_mvc_emg_tab(self, parent):
+        pad = {"padx": 6, "pady": 4}
+        codes = MVC_EMG_CODES
+        # 1. maximal effort, EMG only
+        frm = ttk.LabelFrame(parent, text="1. Maximal effort, EMG only (rest - MAX - recovery, repeated)")
+        frm.pack(anchor="w", fill="x", **pad)
+        fields = (("Efforts:", self.mvc_emg_n_efforts_var), ("Rest (s):", self.mvc_emg_rest_var),
+                  ("MAX (s):", self.mvc_emg_effort_var), ("Recovery (s):", self.mvc_emg_recovery_var))
+        for col, (label, var) in enumerate(fields):
+            ttk.Label(frm, text=label).grid(row=0, column=2 * col, sticky="w", padx=(6 if col == 0 else 12, 4), pady=5)
+            ttk.Entry(frm, textvariable=var, width=6).grid(row=0, column=2 * col + 1, sticky="w")
+        ttk.Label(frm, text="Direction:").grid(row=1, column=0, sticky="w", padx=6, pady=5)
+        dir_row = ttk.Frame(frm)
+        dir_row.grid(row=1, column=1, columnspan=3, sticky="w")
+        ttk.Radiobutton(dir_row, text="Ext", variable=self.mvc_emg_direction_var, value="extension").pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(dir_row, text="Flex", variable=self.mvc_emg_direction_var, value="flexion").pack(side="left")
+        ttk.Label(frm, text="TMSi filename prefix to type:").grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 2))
+        ttk.Label(frm, textvariable=self.mvc_emg_stem_var, font=("Consolas", 10, "bold")).grid(row=2, column=2, columnspan=4, sticky="w", padx=4)
+        ttk.Button(frm, text="Copy", width=6, command=self._mvc_emg_copy_stem).grid(row=2, column=6, sticky="w", padx=4)
+        r1 = ttk.Frame(frm)
+        r1.grid(row=3, column=0, columnspan=8, sticky="w", padx=6, pady=(6, 2))
+        self.mvc_emg_btn_start = ttk.Button(r1, text="Start", width=12, command=self.mvc_emg_on_start)
+        self.mvc_emg_btn_start.pack(side="left", padx=(0, 6))
+        self.mvc_emg_btn_stop = ttk.Button(r1, text="Stop", width=12, state="disabled", command=self.mvc_emg_on_stop)
+        self.mvc_emg_btn_stop.pack(side="left")
+        ttk.Label(frm, textvariable=self.mvc_emg_phase_var, font=("Segoe UI", 9, "bold"), foreground="#ffd700").grid(
+            row=4, column=0, columnspan=8, sticky="w", padx=10, pady=(2, 4))
+        ttk.Label(frm, text=("TMSi app: Start Stream on both SAGAs, type the prefix above, Start Recording, then Start here. "
+                             "Trigger codes: %d rest, %d MAX, %d recovery, 15 stop. The load cell is recorded but not used."
+                             % (codes['rest'], codes['max'], codes['recovery'])),
+                  font=("Segoe UI", 8), foreground="gray", wraplength=760, justify="left").grid(
+            row=5, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 6))
+        # 2. square-wave calibration
+        frm2 = ttk.LabelFrame(parent, text="2. Square-wave calibration (run it in the RAH_LC tab)")
+        frm2.pack(anchor="w", fill="x", **pad)
+        ttk.Label(frm2, text="Levels (N):").grid(row=0, column=0, sticky="w", padx=6, pady=5)
+        ttk.Entry(frm2, textvariable=self.mvc_emg_sq_levels_var, width=22).grid(row=0, column=1, sticky="w")
+        for col, (label, var) in enumerate((("Hold (s):", self.mvc_emg_sq_hold_var), ("Rest (s):", self.mvc_emg_sq_rest_var), ("Ramp (s):", self.mvc_emg_sq_ramp_var))):
+            ttk.Label(frm2, text=label).grid(row=0, column=2 + 2 * col, sticky="w", padx=(12, 4))
+            ttk.Entry(frm2, textvariable=var, width=6).grid(row=0, column=3 + 2 * col, sticky="w")
+        ttk.Button(frm2, text="Send to RAH tab", command=self._mvc_emg_fill_rah).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 2))
+        ttk.Label(frm2, textvariable=self.mvc_emg_sq_status_var, font=("Segoe UI", 8), foreground="gray", wraplength=600, justify="left").grid(
+            row=1, column=2, columnspan=6, sticky="w", padx=6)
+        ttk.Label(frm2, text=("Writes the profile into RAH_LC, sets its MVC value to 100 N (so % = N) and the channel to Fx, and generates the diagram. "
+                              "Type the RAH stem as the TMSi prefix and press Start in RAH_LC."),
+                  font=("Segoe UI", 8), foreground="gray", wraplength=760, justify="left").grid(row=2, column=0, columnspan=8, sticky="w", padx=6, pady=(0, 6))
+        # 3. analysis
+        frm3 = ttk.LabelFrame(parent, text="3. Estimate the MVC force from EMG (choose the files)")
+        frm3.pack(anchor="w", fill="x", **pad)
+        ttk.Label(frm3, text="Calibration Poly5 (RAH trial):").grid(row=0, column=0, sticky="w", padx=6, pady=5)
+        ttk.Entry(frm3, textvariable=self.mvc_emg_cal_poly5_var, width=70).grid(row=0, column=1, columnspan=5, sticky="w")
+        ttk.Button(frm3, text="Browse", width=8, command=self._mvc_emg_browse_cal_poly5).grid(row=0, column=6, sticky="w", padx=4)
+        ttk.Label(frm3, text="Calibration rig log:").grid(row=1, column=0, sticky="w", padx=6, pady=5)
+        ttk.Entry(frm3, textvariable=self.mvc_emg_cal_log_var, width=70).grid(row=1, column=1, columnspan=5, sticky="w")
+        ttk.Button(frm3, text="Browse", width=8, command=self._mvc_emg_browse_cal_log).grid(row=1, column=6, sticky="w", padx=4)
+        ttk.Label(frm3, text="MVC Poly5 (EMG-only efforts):").grid(row=2, column=0, sticky="w", padx=6, pady=5)
+        ttk.Entry(frm3, textvariable=self.mvc_emg_mvc_poly5_var, width=70).grid(row=2, column=1, columnspan=5, sticky="w")
+        ttk.Button(frm3, text="Browse", width=8, command=self._mvc_emg_browse_mvc_poly5).grid(row=2, column=6, sticky="w", padx=4)
+        ttk.Label(frm3, text="The rig log is found from the Poly5 name or time (recordings\\ramp_and_hold); browse to override it.",
+                  font=("Segoe UI", 8), foreground="gray").grid(row=1, column=7, sticky="w", padx=4)
+        ttk.Label(frm3, text="Force:").grid(row=3, column=0, sticky="w", padx=6, pady=5)
+        ttk.Combobox(frm3, textvariable=self.mvc_emg_force_var, values=list(mvc_rigfiles.FORCE_QUANTITIES), width=7, state="readonly").grid(row=3, column=1, sticky="w")
+        ttk.Label(frm3, text="Channels (all / best N):").grid(row=3, column=2, sticky="w", padx=(12, 4))
+        ttk.Entry(frm3, textvariable=self.mvc_emg_nbest_var, width=5).grid(row=3, column=3, sticky="w")
+        ttk.Label(frm3, text="or fixed channels (R1C3,...):").grid(row=3, column=4, sticky="w", padx=(12, 4))
+        ttk.Entry(frm3, textvariable=self.mvc_emg_channels_var, width=24).grid(row=3, column=5, columnspan=2, sticky="w")
+        r3 = ttk.Frame(frm3)
+        r3.grid(row=4, column=0, columnspan=7, sticky="w", padx=6, pady=(6, 2))
+        self.mvc_emg_btn_analyse = ttk.Button(r3, text="Analyse", width=12, command=self.mvc_emg_on_analyse)
+        self.mvc_emg_btn_analyse.pack(side="left", padx=(0, 6))
+        self.mvc_emg_btn_use = ttk.Button(r3, text="Use as RAH MVC value", width=22, state="disabled", command=self._mvc_emg_use_as_rah_mvc)
+        self.mvc_emg_btn_use.pack(side="left", padx=(0, 12))
+        ttk.Label(r3, textvariable=self.mvc_emg_estimate_var, font=("Segoe UI", 11, "bold")).pack(side="left")
+        ttk.Label(frm3, textvariable=self.mvc_emg_analysis_status_var, font=("Segoe UI", 8), foreground="gray", wraplength=760, justify="left").grid(
+            row=5, column=0, columnspan=7, sticky="w", padx=6)
+        self.mvc_emg_result_text = tk.Text(frm3, height=18, width=112, font=("Consolas", 8), state="disabled", wrap="none")
+        self.mvc_emg_result_text.grid(row=6, column=0, columnspan=7, sticky="w", padx=6, pady=(4, 2))
+        self.mvc_emg_fig_label = tk.Label(frm3)
+        self.mvc_emg_fig_label.grid(row=7, column=0, columnspan=7, sticky="w", padx=6, pady=(2, 8))
+        for var in (self.trial_var, self.file_prefix_var, self.handedness_var, self.mvc_emg_direction_var):
+            try:
+                var.trace_add('write', self._mvc_emg_refresh_stem)
+            except Exception:
+                pass
+        self._mvc_emg_refresh_stem()
+
+    # ---- 1. maximal effort, EMG only -------------------------------------------------------------
+    def _mvc_emg_stem_base(self) -> str:
+        hand_str = 'R' if self.handedness_var.get() == 'Right' else 'L'
+        dir_str = self._direction_choice_to_code(self.mvc_emg_direction_var.get())
+        return self._trial_prefixed_stem(f'MVC_EMG_{hand_str}_{dir_str}')
+
+    def _mvc_emg_refresh_stem(self, *_):
+        try:
+            self.mvc_emg_stem_var.set(self._mvc_emg_stem_base())
+        except Exception:
+            pass
+
+    def _mvc_emg_copy_stem(self):
+        text = self.mvc_emg_stem_var.get().strip()
+        if not text:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.mvc_emg_phase_var.set(f'copied "{text}": paste it as the TMSi filename prefix')
+        except Exception:
+            pass
+
+    def _mvc_emg_phase_table(self, n, rest_s, max_s, rec_s):
+        """[(phase, code, start_s, end_s, effort_index)] and the total duration."""
+        phases, t = [], 0.0
+        for i in range(n):
+            phases.append(('rest', MVC_EMG_CODES['rest'], t, t + rest_s, i)); t += rest_s
+            phases.append(('max', MVC_EMG_CODES['max'], t, t + max_s, i)); t += max_s
+            if i < n - 1 and rec_s > 0:
+                phases.append(('recover', MVC_EMG_CODES['recovery'], t, t + rec_s, i)); t += rec_s
+        return phases, t
+
+    def mvc_emg_on_start(self):
+        if self._mvc_emg_running or self._mvc_emg_countdown_active:
+            return
+        if not self._require_experiment_connections():
+            return
+        n = int(round(self._parse_float(self.mvc_emg_n_efforts_var, 3)))
+        rest_s = self._parse_float(self.mvc_emg_rest_var, 5.0)
+        max_s = self._parse_float(self.mvc_emg_effort_var, 5.0)
+        rec_s = self._parse_float(self.mvc_emg_recovery_var, 60.0)
+        if n < 1 or not (rest_s > 0 and max_s > 0 and rec_s >= 0) or not all(_math.isfinite(v) for v in (rest_s, max_s, rec_s)):
+            messagebox.showerror("MVC_EMG", "Efforts must be at least 1; rest and MAX durations must be positive; recovery 0 or more.")
+            return
+        phases, total = self._mvc_emg_phase_table(n, rest_s, max_s, rec_s)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        hand_str = "R" if self.handedness_var.get() == "Right" else "L"
+        direction_choice = self.mvc_emg_direction_var.get()
+        dir_str = self._direction_choice_to_code(direction_choice)
+        vicon_base = self._trial_prefixed_stem(f"MVC_EMG_{hand_str}_{dir_str}")
+        stem = self._trial_prefixed_stem(f"MVC_EMG_{hand_str}_{dir_str}_{ts}")
+        self._make_file_paths("mvc_emg", stem)
+        self._set_vicon_capture_default(vicon_base)
+        self.mvc_emg_btn_start.config(state="disabled")
+        self.mvc_emg_btn_stop.config(state="disabled")
+        self.mvc_emg_phase_var.set("starting in 3...")
+        self.motion_status.set("MVC_EMG - starting in 3...")
+        self._mvc_emg_countdown_active = True
+        self._mvc_emg_phases = phases
+        self._mvc_emg_total_s = total
+        self._mvc_emg_phase_log = []
+        self._mvc_emg_gui_log_run_name = vicon_base
+        self._mvc_emg_params = {'n': n, 'rest_s': rest_s, 'max_s': max_s, 'recovery_s': rec_s, 'stem': stem}
+        cue_schedule = ",".join(f"{name}({code}):{a:.3f}-{b:.3f}" for name, code, a, b, _ in phases)
+
+        def _launch():
+            self._mvc_emg_countdown_active = False
+            rest_angle = self._get_wrist()
+            mode = RestMode(rest_angle_deg=rest_angle, damper_pwm=255)
+            mode.reset()
+            self._mvc_emg_running = True
+            self._mvc_emg_rest_angle = rest_angle
+            self._write_log_header({
+                "experiment": "mvc_emg",
+                "direction": self._direction_choice_to_label(direction_choice),
+                "rest_angle_deg": f"{rest_angle:.3f}",
+                "n_efforts": n, "rest_s": f"{rest_s:.3f}", "max_s": f"{max_s:.3f}", "recovery_s": f"{rec_s:.3f}",
+                "total_duration_s": f"{total:.3f}",
+                "cue_schedule": cue_schedule,
+                "marker_codes": f"{MVC_EMG_CODES['rest']}=rest,{MVC_EMG_CODES['max']}=max_effort,{MVC_EMG_CODES['recovery']}=recovery,15=stop",
+                "force_used": "no (EMG only; the load cell is recorded for completeness)",
+                "tmsi_prefix": vicon_base,
+                "tmsi_flexor_tag": self.mvc_emg_tag_var.get().strip(),
+                **self._optional_hardware_log_fields(),
+            })
+            self._stamp_log_launch_time()
+            self.serial_worker.send("ZERO_VEL")
+            self.serial_worker.send("MODE_EXT")
+            self.serial_worker.send("TORQUE_ON")
+            self.serial_worker.send("SET_DMP:255")
+            self.motion_runner.start(mode)
+            self._start_primary_csv(mode)
+            self._start_session_recording()          # before the first marker, or its row is lost
+            self._mvc_emg_t0 = time.perf_counter()
+            self.mvc_emg_btn_stop.config(state="normal")
+            self.rec_status_var.set(self._session_record_status("Recording"))
+            self._mvc_emg_enter_phase(0)
+
+        self.display.countdown(_launch)
+
+    def _mvc_emg_enter_phase(self, k):
+        if not self._mvc_emg_running:
+            return
+        if k >= len(self._mvc_emg_phases):
+            self.mvc_emg_on_stop()
+            return
+        name, code, start_s, end_s, i = self._mvc_emg_phases[k]
+        self._set_phase_marker(code)
+        now = time.perf_counter()
+        t0_trig = getattr(self, "_trigger_timing_t0", None)
+        self._mvc_emg_phase = name
+        self._mvc_emg_phase_end_perf = self._mvc_emg_t0 + end_s
+        self._mvc_emg_effort_index = i
+        self._mvc_emg_phase_log.append((name, code, i + 1, now - self._mvc_emg_t0, (now - t0_trig) if t0_trig else float("nan")))
+        n = self._mvc_emg_params.get('n', 0)
+        label = {"rest": "REST", "max": "MAX EFFORT", "recover": "recovery"}.get(name, name)
+        self.mvc_emg_phase_var.set(f"effort {i + 1}/{n}: {label} ({end_s - start_s:g} s)")
+        self.motion_status.set(f"MVC_EMG - effort {i + 1}/{n} {label}")
+        delay_ms = max(0, int((self._mvc_emg_t0 + end_s - time.perf_counter()) * 1000))
+        self._mvc_emg_after_id = self.after(delay_ms, self._mvc_emg_enter_phase, k + 1)
+
+    def _mvc_emg_cancel_timers(self):
+        if getattr(self, "_mvc_emg_after_id", None) is not None:
+            try:
+                self.after_cancel(self._mvc_emg_after_id)
+            except Exception:
+                pass
+            self._mvc_emg_after_id = None
+
+    def mvc_emg_on_stop(self):
+        if not self._mvc_emg_running:
+            return
+        self._mvc_emg_running = False
+        self._mvc_emg_cancel_timers()
+        completed = sum(1 for name, _, _, _, _ in self._mvc_emg_phase_log if name == "max")
+        n = self._mvc_emg_params.get('n', 0)
+        stopped_early = completed < n or (self._mvc_emg_phase == "max" and (self._mvc_emg_phase_end_perf or 0) > time.perf_counter() + 0.05)
+        self._set_phase_marker(0)                    # code 15, before the recorders close
+        rows = self._stop_primary_csv()
+        self._stop_session_recording()
+        self._append_mvc_emg_summary(completed, stopped_early)
+        self._copy_to_subdir()
+        try:
+            self.motion_runner.stop(release=False)
+        except Exception:
+            pass
+        self.serial_worker.send("TORQUE_OFF")
+        self.serial_worker.send("SET_DMP:0")
+        stem = self._mvc_emg_params.get('stem', '')
+        self.mvc_emg_phase_var.set(f"saved | {completed}/{n} efforts{' (stopped early)' if stopped_early else ''} | {stem}")
+        self.rec_status_var.set(self._session_record_status("Saved", rows))
+        p = self._mvc_emg_params
+        self._append_gui_session_log(self._mvc_emg_gui_log_run_name or self._current_vicon_base_for_tab(), "MVC_EMG", self._mvc_emg_total_s, {
+            "mvc_value": "EMG only", "rest_angle_deg": f"{self._mvc_emg_rest_angle:.3f}", "efforts": f"{completed}/{n}",
+            "rest_s": f"{p.get('rest_s', 0):g}", "max_s": f"{p.get('max_s', 0):g}", "recovery_s": f"{p.get('recovery_s', 0):g}",
+            "cue_schedule": ",".join(f"{name}({code}):{a:.1f}-{b:.1f}" for name, code, a, b, _ in self._mvc_emg_phases)})
+        self._mvc_emg_phase = ""
+        self._mvc_emg_phase_end_perf = None
+        self.motion_status.set("Idle")
+        self.mvc_emg_btn_start.config(state="normal")
+        self.mvc_emg_btn_stop.config(state="disabled")
+        self._draw_canvas_idle()
+        self._trial_increment()
+
+    def _append_mvc_emg_summary(self, completed, stopped_early):
+        try:
+            self._append_log_line("=" * 44)
+            self._append_log_line("MVC_EMG Summary")
+            self._append_log_line("=" * 44)
+            self._append_log_line(f"{'efforts_completed:':<28}{completed}")
+            self._append_log_line(f"{'stopped_early:':<28}{int(bool(stopped_early))}")
+            self._append_log_line(f"{'phase_log:':<28}phase(code) effort start_s_from_launch start_s_rig_clock")
+            for name, code, effort, t_launch, t_rig in self._mvc_emg_phase_log:
+                self._append_log_line(f"{'  ':<28}{name}({code}) {effort} {t_launch:.3f} {t_rig:.3f}")
+        except Exception:
+            pass
+
+    # ---- 2. square-wave calibration ----------------------------------------------------------------
+    def _rah_busy(self) -> bool:
+        return (getattr(self, '_rah_mode_ref', None) is not None or getattr(self, '_practice_mode_ref', None) is not None
+                or bool(getattr(self, '_rah_countdown_active', False)))
+
+    def _mvc_emg_fill_rah(self):
+        if self._rah_busy():
+            messagebox.showerror("MVC_EMG", "Stop the RAH run or practice first.")
+            return
+        try:
+            levels = [float(x) for x in re.split(r"[,\s;]+", self.mvc_emg_sq_levels_var.get().strip()) if x]
+            hold_s = float(self.mvc_emg_sq_hold_var.get())
+            rest_s = float(self.mvc_emg_sq_rest_var.get())
+            ramp_s = float(self.mvc_emg_sq_ramp_var.get())
+            points = mvc_rigfiles.square_wave_points(levels, hold_s, rest_s, ramp_s, mvc_value=100.0)
+        except Exception as exc:
+            messagebox.showerror("MVC_EMG", f"Cannot build the profile: {exc}")
+            return
+        self._rah_profile_var().set(mvc_rigfiles.format_points(points))
+        self._rah_perturbation_var().set("")
+        self.rah_limit_var.set("100")
+        self.rah_channel_var.set("Fx")
+        self._generate_rah_diagram()
+        for tab_id in self.notebook.tabs():
+            try:
+                if self.notebook.tab(tab_id, "text").strip() == "RAH_LC":
+                    self.notebook.select(tab_id)
+                    break
+            except Exception:
+                pass
+        self.mvc_emg_sq_status_var.set(f"RAH profile set: {len(levels)} levels ({', '.join(f'{v:g}' for v in levels)} N), {points[-1][0]:g} s, MVC value 100 N (% = N), channel Fx. "
+                                       f"Check the direction in RAH_LC, type its stem as the TMSi prefix and press Start there.")
+
+    # ---- 3. analysis -------------------------------------------------------------------------------
+    def _mvc_emg_pick_poly5(self, title):
+        start = self.mvc_emg_tmsi_dir_var.get().strip() or TMSI_RECORDINGS_DIR
+        path = filedialog.askopenfilename(parent=self, title=title, initialdir=start if os.path.isdir(start) else None,
+                                          filetypes=[("TMSi Poly5", "*.poly5"), ("All files", "*.*")])
+        if path:
+            self.mvc_emg_tmsi_dir_var.set(os.path.dirname(path))
+            mvc_rigfiles.save_settings(MVC_EMG_SETTINGS_PATH, {'tag': self.mvc_emg_tag_var.get().strip(), 'tmsi_dir': os.path.dirname(path)})
+        return path
+
+    def _mvc_emg_browse_cal_poly5(self):
+        path = self._mvc_emg_pick_poly5("Calibration Poly5 (the square-wave RAH trial)")
+        if not path:
+            return
+        self.mvc_emg_cal_poly5_var.set(path)
+        log, note = mvc_rigfiles.find_rig_log(str(DATA_ROOT), "ramp_and_hold", path)
+        self.mvc_emg_cal_log_var.set(log or "")
+        self.mvc_emg_analysis_status_var.set(note if log else f"{note}: browse for the calibration rig log")
+
+    def _mvc_emg_browse_cal_log(self):
+        start = os.path.join(str(DATA_ROOT), "ramp_and_hold")
+        path = filedialog.askopenfilename(parent=self, title="Rig log of the calibration (RAH) trial", initialdir=start if os.path.isdir(start) else None,
+                                          filetypes=[("rig log", "*_log.txt"), ("All files", "*.*")])
+        if path:
+            self.mvc_emg_cal_log_var.set(path)
+
+    def _mvc_emg_browse_mvc_poly5(self):
+        path = self._mvc_emg_pick_poly5("MVC Poly5 (the EMG-only maximal efforts)")
+        if not path:
+            return
+        self.mvc_emg_mvc_poly5_var.set(path)
+        log, note = mvc_rigfiles.find_rig_log(str(DATA_ROOT), "mvc_emg", path)
+        self.mvc_emg_mvc_log_var.set(log or "")
+        self.mvc_emg_analysis_status_var.set(note if log else "MVC Poly5 chosen; no MVC_EMG rig log matched (defaults of 5 s efforts, codes 6/7 are used)")
+
+    def mvc_emg_on_analyse(self):
+        t = getattr(self, "_mvc_emg_analysis_thread", None)
+        if t is not None and t.is_alive():
+            return
+        cal_poly5 = self.mvc_emg_cal_poly5_var.get().strip()
+        rah = self.mvc_emg_cal_log_var.get().strip()
+        mvc_poly5 = self.mvc_emg_mvc_poly5_var.get().strip()
+        mvc_log = self.mvc_emg_mvc_log_var.get().strip() or None
+        if not os.path.isfile(cal_poly5):
+            messagebox.showerror("MVC_EMG", "Choose the calibration Poly5 file (Browse).")
+            return
+        if not os.path.isfile(rah):
+            messagebox.showerror("MVC_EMG", "No rig log for the calibration trial: browse for <stem>_log.txt in recordings\\ramp_and_hold.")
+            return
+        if not os.path.isfile(mvc_poly5):
+            messagebox.showerror("MVC_EMG", "Choose the MVC Poly5 file (Browse).")
+            return
+        if mvc_log and not os.path.isfile(mvc_log):
+            mvc_log = None
+        tag = self.mvc_emg_tag_var.get().strip() or MVC_EMG_DEFAULTS['tag']
+        tmsi_dir = os.path.dirname(cal_poly5)
+        force = self.mvc_emg_force_var.get().strip() or "Fx"
+        nb_txt = self.mvc_emg_nbest_var.get().strip().lower()
+        n_best = 0 if nb_txt in ('', 'all') else int(round(self._parse_float(self.mvc_emg_nbest_var, MVC_EMG_DEFAULTS['n_best'])))
+        channels = tuple(s.strip() for s in re.split(r"[,\s;]+", self.mvc_emg_channels_var.get().strip()) if s.strip())
+        out_dir = os.path.join(str(DATA_ROOT), "mvc_emg", f"{os.path.basename(rah)[:-len('_log.txt')]}__mvc_from_emg")
+        self.mvc_emg_btn_analyse.config(state="disabled")
+        self.mvc_emg_btn_use.config(state="disabled")
+        self.mvc_emg_estimate_var.set("")
+        self.mvc_emg_analysis_status_var.set("loading numpy, scipy and matplotlib...")
+        # The worker never touches Tk: it puts (callable, args) on a queue that the Tk thread drains.
+        self._mvc_emg_queue = queue.Queue()
+
+        def _post(fn, *args):
+            self._mvc_emg_queue.put((fn, args))
+
+        def _work():
+            try:
+                import importlib
+                analysis = importlib.import_module("mvc_emg.analysis")
+                params = analysis.Params(force_quantity=force, n_best=n_best, explicit_channels=channels,
+                                         mvc_rest_code=MVC_EMG_CODES['rest'], mvc_max_code=MVC_EMG_CODES['max'],
+                                         spread_limit_pct=MVC_EMG_DEFAULTS['spread_limit_pct'])
+                result = analysis.run(rah, [mvc_log], tmsi_dir, tag, params, progress=lambda m: _post(self.mvc_emg_analysis_status_var.set, m),
+                                      out_dir=out_dir, mvc_poly5_override=[mvc_poly5], cal_poly5_override=cal_poly5)
+                text = analysis.summary_text(result)
+                png = analysis.render_png(result, width=860, height=600)
+                _post(self._mvc_emg_show_result, result, text, png)
+            except ImportError as exc:
+                _post(self._mvc_emg_show_error, str(exc))
+            except Exception as exc:  # noqa: BLE001
+                _post(self._mvc_emg_show_error, f"{type(exc).__name__}: {exc}")
+
+        self._mvc_emg_analysis_thread = threading.Thread(target=_work, daemon=True)
+        self._mvc_emg_analysis_thread.start()
+        self._mvc_emg_poll_queue()
+
+    def _mvc_emg_poll_queue(self):
+        """Run the worker's posted callbacks on the Tk thread; keeps polling while the worker is alive."""
+        q = getattr(self, "_mvc_emg_queue", None)
+        while q is not None:
+            try:
+                fn, args = q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn(*args)
+            except Exception as exc:  # noqa: BLE001
+                self.mvc_emg_analysis_status_var.set(f"display error: {exc}")
+        t = getattr(self, "_mvc_emg_analysis_thread", None)
+        if (t is not None and t.is_alive()) or (q is not None and not q.empty()):
+            self.after(100, self._mvc_emg_poll_queue)
+
+    def _mvc_emg_set_text(self, text):
+        w = self.mvc_emg_result_text
+        w.config(state="normal")
+        w.delete("1.0", "end")
+        w.insert("1.0", text)
+        w.config(state="disabled")
+
+    def _mvc_emg_show_result(self, result, text, png):
+        self._mvc_emg_last_result = result
+        self._mvc_emg_set_text(text)
+        try:
+            import io as _io
+            from PIL import Image, ImageTk
+            img = Image.open(_io.BytesIO(png))
+            img.load()
+            photo = ImageTk.PhotoImage(img, master=self.mvc_emg_fig_label)
+            self.mvc_emg_fig_label.configure(image=photo)
+            self._mvc_emg_fig_photo = photo          # keep the reference or Tk drops the image
+        except Exception as exc:  # noqa: BLE001
+            self.mvc_emg_analysis_status_var.set(f"figure not shown: {exc}")
+        est = getattr(result, "mvc_estimate_N", float("nan"))
+        if est == est and est > 0:
+            self.mvc_emg_estimate_var.set(f"approx. MVC {est:.1f} N")
+            self.mvc_emg_btn_use.config(state="normal")
+        else:
+            self.mvc_emg_estimate_var.set("no usable estimate")
+        self.mvc_emg_analysis_status_var.set(f"done; report, figure and epochs in {getattr(result, 'out_dir', '')}")
+        self.mvc_emg_btn_analyse.config(state="normal")
+
+    def _mvc_emg_show_error(self, msg):
+        self.mvc_emg_analysis_status_var.set(f"failed: {msg}")
+        self._mvc_emg_set_text(f"Analysis failed:\n{msg}")
+        self.mvc_emg_btn_analyse.config(state="normal")
+
+    def _mvc_emg_use_as_rah_mvc(self):
+        result = self._mvc_emg_last_result
+        est = getattr(result, "mvc_estimate_N", float("nan")) if result is not None else float("nan")
+        if not (est == est and est > 0):
+            messagebox.showerror("MVC_EMG", "No usable estimate to apply.")
+            return
+        if self._rah_busy():
+            messagebox.showerror("MVC_EMG", "Stop the RAH run or practice first.")
+            return
+        self.rah_limit_var.set(f"{est:.1f}")
+        config, error = self._rah_schedule_config()
+        if not error:
+            self._generate_rah_diagram()
+        self.mvc_emg_analysis_status_var.set(f"RAH MVC value set to {est:.1f} N (from EMG; {getattr(result, 'calibration_stem', '')})")
+
     def _build_rah_tab(self, parent):
         pad = {'padx': 6, 'pady': 4}
         frm = ttk.LabelFrame(parent, text='Parameters')
@@ -544,7 +1072,7 @@ class ExpGUI(tk.Tk):
         ttk.Label(frm, text='MVC value (N or Nmm):').grid(row=0, column=0, sticky='w', padx=6, pady=5)
         ttk.Entry(frm, textvariable=self.rah_limit_var, width=8).grid(row=0, column=1, sticky='w', padx=4)
         ttk.Label(frm, text='LC Channel:').grid(row=0, column=2, sticky='w', padx=(16, 6), pady=5)
-        ttk.Combobox(frm, textvariable=self.rah_channel_var, values=['Fx', 'Fy', 'Fz', 'Tx', 'Ty', 'Tz', 'Fnorm', 'Tnorm'], width=7, state='readonly').grid(row=0, column=3, sticky='w', padx=4)
+        ttk.Combobox(frm, textvariable=self.rah_channel_var, values=['Fx', 'Fy', 'Fz', 'Tx', 'Ty', 'Tz', 'Fnorm', 'Tnorm', 'Fxy'], width=7, state='readonly').grid(row=0, column=3, sticky='w', padx=4)
         ttk.Label(frm, text='Direction:').grid(row=1, column=0, sticky='w', padx=6, pady=5)
         dir_row = ttk.Frame(frm)
         dir_row.grid(row=1, column=1, columnspan=3, sticky='w', padx=4, pady=5)
@@ -555,6 +1083,11 @@ class ExpGUI(tk.Tk):
         ttk.Label(frm, text='Perturbation (time, direction, velocity, angle):').grid(row=3, column=0, sticky='w', padx=6, pady=5)
         ttk.Entry(frm, textvariable=self.rah_perturbation_schedule_var, width=72).grid(row=3, column=1, columnspan=3, sticky='ew', padx=4, pady=5)
         ttk.Button(frm, text='Generate Diagram', command=lambda : self._generate_rah_diagram(), width=18).grid(row=4, column=1, sticky='w', padx=4, pady=(4, 8))
+        ttk.Label(frm, text='Game theme:').grid(row=4, column=2, sticky='w', padx=(16, 6), pady=(4, 8))
+        theme_box = ttk.Combobox(frm, textvariable=self.rah_theme_var, values=[t['title'] for t in themes.THEMES.values()],
+                                 width=14, state='readonly')
+        theme_box.grid(row=4, column=3, sticky='w', padx=4, pady=(4, 8))
+        theme_box.bind('<<ComboboxSelected>>', self._on_rah_theme_selected)
         frm.columnconfigure(3, weight=1)
         frm2 = ttk.LabelFrame(parent, text='Experiment Control')
         frm2.pack(anchor='w', **pad)
@@ -564,7 +1097,20 @@ class ExpGUI(tk.Tk):
         self.rah_player_id_entry = ttk.Entry(player_row, textvariable=self.rah_player_id_var, width=24)
         self.rah_player_id_entry.pack(side='left', padx=(0, 8))
         ttk.Button(player_row, text='View Scores', command=self._show_rah_scores).pack(side='left')
-        ttk.Label(frm2, text='Optional ID; only your best complete run is kept. 1 coin = 1 point.').pack(anchor='w', padx=10, pady=(2, 2))
+        ttk.Button(player_row, text='Show leaderboard on display', command=lambda: self._show_leaderboard_on_display()).pack(side='left', padx=(8, 0))
+        ttk.Button(player_row, text='Hide', command=self._hide_leaderboard_on_display, width=6).pack(side='left', padx=(4, 0))
+        self._rah_score_rule_lbl = ttk.Label(frm2, text=self._rah_score_rule_text())
+        self._rah_score_rule_lbl.pack(anchor='w', padx=10, pady=(2, 2))
+        practice_row = ttk.Frame(frm2)
+        practice_row.pack(fill='x', padx=6, pady=(6, 2))
+        ttk.Label(practice_row, text='Practice (not recorded):').pack(side='left', padx=(0, 6))
+        self.rah_btn_practice = ttk.Button(practice_row, text='Practice', command=self.rah_practice_on_start, width=14)
+        self.rah_btn_practice.pack(side='left', padx=(0, 6))
+        self.rah_btn_practice_stop = ttk.Button(practice_row, text='Stop practice', command=self.rah_practice_on_stop, width=14, state='disabled')
+        self.rah_btn_practice_stop.pack(side='left', padx=(0, 12))
+        ttk.Label(practice_row, text='Top of screen (% MVC):').pack(side='left', padx=(0, 4))
+        ttk.Entry(practice_row, textvariable=self.rah_practice_top_var, width=6).pack(side='left')
+        ttk.Label(frm2, text='Practice holds the wrist like a run and shows the robot from the baseline (0) to the top of the screen; nothing is saved. Start ends the practice and begins the recorded run with the diagram above.').pack(anchor='w', padx=10, pady=(0, 2))
         r1 = ttk.Frame(frm2)
         r1.pack(fill='x', padx=6, pady=(6, 2))
         self.rah_btn_start = ttk.Button(r1, text='  Start', command=self.rah_on_start, width=14, state='disabled')
@@ -1056,7 +1602,8 @@ class ExpGUI(tk.Tk):
             idx = len(self.dr_instruction_vars)
             default = "extension" if idx % 2 == 0 else "flexion"
             self.dr_instruction_vars.append(tk.StringVar(value=default))
-        del self.dr_instruction_vars[count:]
+        # Extra entries are kept (only the first ``count`` are shown and used), so typing a new
+        # rep count digit by digit does not wipe the choices made for the later reps.
 
     def _refresh_dr_instruction_inputs(self):
         frame = getattr(self, "dr_instruction_frame", None)
@@ -1069,7 +1616,7 @@ class ExpGUI(tk.Tk):
         ttk.Label(frame, text="Instruction per rep:").pack(side="left", padx=(0, 8))
         grid = ttk.Frame(frame)
         grid.pack(side="left", fill="x", expand=True)
-        for idx, var in enumerate(self.dr_instruction_vars, start=1):
+        for idx, var in enumerate(self.dr_instruction_vars[:count], start=1):
             cell = ttk.Frame(grid)
             cell.grid(row=(idx - 1) // 5, column=(idx - 1) % 5, sticky="w", padx=(0, 12), pady=2)
             ttk.Label(cell, text=f"{idx}:").pack(side="left")
@@ -1131,7 +1678,7 @@ class ExpGUI(tk.Tk):
 
         ttk.Label(frm, text="Feedback LC Channel:").grid(row=4, column=0, sticky="w", padx=6, pady=5)
         ttk.Combobox(frm, textvariable=self.dr_lc_channel_var,
-                     values=["Fx","Fy","Fz","Tx","Ty","Tz","Fnorm","Tnorm"],
+                     values=["Fx","Fy","Fz","Tx","Ty","Tz","Fnorm","Tnorm","Fxy"],
                      width=7, state="readonly").grid(row=4, column=1, sticky="w", padx=4)
 
         self.dr_instruction_frame = ttk.Frame(frm)
@@ -1618,9 +2165,10 @@ class ExpGUI(tk.Tk):
                 key: tk.StringVar(master=self, value=f"{float(value):g}")
                 for key, value in zip(keys, values)
             })
-        del self.follow_path_rep_vars[count:]
+        # Extra rows are kept (only the first ``count`` are shown and used), so typing a new rep
+        # count digit by digit does not wipe the values entered for the later reps.
 
-    def _draw_follow_path_rep_inputs(self, mode: str):
+    def _draw_follow_path_rep_inputs(self, mode: str, count=None):
         frame = getattr(self, "follow_path_rep_frame", None)
         if frame is None:
             return
@@ -1628,6 +2176,7 @@ class ExpGUI(tk.Tk):
             child.destroy()
         if mode == "change nothing":
             return
+        rows = self.follow_path_rep_vars if count is None else self.follow_path_rep_vars[:count]
         if mode == "change velocity":
             columns = (("go_speed", "go speed"), ("return_speed", "return speed"))
         elif mode == "change end points":
@@ -1644,7 +2193,7 @@ class ExpGUI(tk.Tk):
         for col, label in enumerate(headers):
             ttk.Label(frame, text=label, foreground="gray").grid(
                 row=0, column=col, sticky="w", padx=(0, 8), pady=(0, 2))
-        for idx, row_vars in enumerate(self.follow_path_rep_vars, start=1):
+        for idx, row_vars in enumerate(rows, start=1):
             ttk.Label(frame, text=f"{idx}:").grid(row=idx, column=0, sticky="w", padx=(0, 8), pady=2)
             for col, (key, _label) in enumerate(columns, start=1):
                 ttk.Entry(frame, textvariable=row_vars[key], width=8).grid(
@@ -1705,7 +2254,7 @@ class ExpGUI(tk.Tk):
         self._follow_global_param_visibility(mode)
         if hasattr(self, "follow_path_rep_frame") and mode != "change nothing":
             self._ensure_follow_path_rep_vars(count)
-        self._draw_follow_path_rep_inputs(mode)
+        self._draw_follow_path_rep_inputs(mode, count)
 
 
     # ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â
@@ -1865,16 +2414,49 @@ class ExpGUI(tk.Tk):
         "final_rest": 1,
     }
 
+    def _set_phase_marker(self, marker, *, skip_if_prev_in=()):
+        """Set the CSV marker and queue its trigger when the marker changes.
+
+        Safe from any thread: the motion thread's phase callbacks and the Tk thread share one
+        lock, so a transition is never sent twice. Cheap: the trigger command is only put on
+        the trigger worker's queue; its sender thread writes it and waits for the ACK.
+        """
+        marker = int(marker)
+        with self._marker_lock:
+            prev = int(getattr(self.recorder, "current_marker", 0) or 0)
+            if prev == marker or prev in skip_if_prev_in:
+                return False
+            self.recorder.set_marker(marker)
+            self._emit_marker(prev, marker)
+            return True
+
     def _update_rah_phase_marker(self, mode):
-        """Keep RAH CSV marker and external trigger aligned with the current phase."""
+        """Tk-loop fallback: align marker and trigger with the mode's phase (normally a no-op,
+        the motion thread's phase callback has already done it)."""
         marker = self._RAH_PHASE_TO_MARKER.get(getattr(mode, "sub_phase", ""))
         if marker is None:
             return
-        prev = int(getattr(self.recorder, "current_marker", 0) or 0)
-        if prev == marker:
+        self._set_phase_marker(marker)
+
+    def _on_rah_phase_change(self, mode, _prev_phase, new_phase):
+        """RAHMode phase callback, run on the 100 Hz motion thread at the tick that starts the
+        phase. The CSV marker and the TMSi/Vicon trigger follow the profile here instead of
+        the 100 ms GUI loop, which added 0-100 ms plus whatever the GUI was drawing. Only
+        thread-safe calls belong here (recorder, trigger queue, plain attributes), never Tk."""
+        if mode is not self._rah_mode_ref:
             return
-        self.recorder.set_marker(marker)
-        self._emit_marker(prev, marker)
+        marker = 4 if new_phase == "done" else self._RAH_PHASE_TO_MARKER.get(new_phase)
+        if marker is None:
+            return
+        if self._rah_t0 is None:
+            # First phase of the run: the run clock starts now, with the start marker (1).
+            self._rah_t0 = time.time()
+            if marker != 1:
+                self._set_phase_marker(1)
+        if new_phase == "done":
+            self._set_phase_marker(4, skip_if_prev_in=(0,))
+        else:
+            self._set_phase_marker(marker)
 
 
     def _trial_increment(self):
@@ -2089,6 +2671,12 @@ class ExpGUI(tk.Tk):
         elif type_name in ('MVC_LC',):
             percent_mvc = info.get('mvc_value', '')
             wrist_angle = info.get('rest_angle_deg', '')
+        elif type_name == 'MVC_EMG':
+            display_type = 'MVC (EMG only)'
+            percent_mvc = info.get('mvc_value', '')
+            wrist_angle = info.get('rest_angle_deg', '')
+            reps = f"{info.get('efforts', '')} efforts ({info.get('rest_s', '')}s rest, {info.get('max_s', '')}s max, {info.get('recovery_s', '')}s recovery)"
+            diagram_schedule = info.get('cue_schedule', '')
         elif type_name in ('RAH_LC',):
             percent_mvc = info.get('mvc_pct', '')
             diagram_schedule = info.get('diagram_schedule', '')
@@ -2160,6 +2748,21 @@ class ExpGUI(tk.Tk):
                 self._append_xlsx_row(path, row)
         except Exception as exc:
             print(f"[GUI session log] write failed: {exc}", flush=True)
+            self._append_gui_session_log_sidecar(path, row, exc)
+
+    def _append_gui_session_log_sidecar(self, path: str, row, exc):
+        """The xlsx could not be updated (open in Excel, locked by a scanner): keep the row in a
+        CSV next to it so that no run is missing from the session log."""
+        try:
+            sidecar = os.path.splitext(path)[0] + "_pending_rows.csv"
+            is_new = not os.path.exists(sidecar)
+            with open(sidecar, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                if is_new:
+                    writer.writerow(["rows that could not be written to the xlsx, in its column order", "error"])
+                writer.writerow([str(value) for value in row] + [str(exc)])
+        except Exception as exc2:
+            print(f"[GUI session log] sidecar write failed: {exc2}", flush=True)
 
     def _close_gui_session_log(self):
         f = getattr(self, "_gui_session_log_file", None)
@@ -2188,6 +2791,9 @@ class ExpGUI(tk.Tk):
         if tab_text == 'MVC_LC':
             dir_str = self._direction_choice_to_code(self.mvc_lc_direction_var.get())
             return self._trial_prefixed_stem(f'MVC_LC_{hand_str}_{dir_str}')
+        if tab_text == 'MVC_EMG':
+            dir_str = self._direction_choice_to_code(self.mvc_emg_direction_var.get())
+            return self._trial_prefixed_stem(f'MVC_EMG_{hand_str}_{dir_str}')
         if tab_text == 'RAH_LC':
             dir_str = self._direction_choice_to_code(self.rah_direction_var.get())
             return self._trial_prefixed_stem(f'RAH_{hand_str}_{dir_str}')
@@ -2223,6 +2829,7 @@ class ExpGUI(tk.Tk):
             except Exception:
                 pass
         self._vicon_default_trace_vars = [self.trial_var, self.file_prefix_var, self.handedness_var, self.mvc_lc_direction_var, self.rah_direction_var, self.dr_reps_var, self.pm_start_var, self.pm_target_var, self.follow_start_var, self.follow_target_var, self.follow_speed_var, self.follow_change_mode_var, self.follow_path_var, self.follow_reps_var]
+        self._vicon_default_trace_vars.append(self.mvc_emg_direction_var)
         for var in self._vicon_default_trace_vars:
             try:
                 var.trace_add('write', _refresh)
@@ -2383,7 +2990,7 @@ class ExpGUI(tk.Tk):
         return path
 
     def _experiment_busy_for_free_record(self) -> bool:
-        return self.recorder.recording or bool(getattr(self, '_motion_polling', False)) or bool(getattr(self, '_rest_running', False)) or bool(getattr(self, '_mvc_running', False)) or False
+        return self.recorder.recording or bool(getattr(self, '_motion_polling', False)) or bool(getattr(self, '_rest_running', False)) or bool(getattr(self, '_mvc_running', False)) or bool(getattr(self, '_mvc_emg_running', False)) or False
 
     def free_record_on_start(self):
         if self._experiment_busy_for_free_record():
@@ -2449,10 +3056,22 @@ class ExpGUI(tk.Tk):
         except Exception:
             pass
 
+    def _stamp_log_launch_time(self):
+        """Append the wall-clock time at which the countdown ended and the run began.
+
+        start_time_local in the header is stamped when Start is pressed, i.e. the countdown
+        (3.5 s) earlier; launch_time_local is the moment recording and motion start.
+        """
+        try:
+            with open(self._log_path, "a", encoding="utf-8") as f:
+                f.write(f"{'launch_time_local:':<28}{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}\n")
+        except Exception:
+            pass
+
     def _parse_float(self, var, default: float) -> float:
         try:
             return float(var.get())
-        except ValueError:
+        except (ValueError, tk.TclError):
             return default
 
 
@@ -2693,6 +3312,15 @@ class ExpGUI(tk.Tk):
     def _require_manual_serial(self):
         if not self.serial_worker.connected:
             messagebox.showerror("Error", "Connect Exo Serial first.")
+            return False
+        return True
+
+    def _require_manual_idle(self):
+        """Manual motor commands are refused while a task or a practice holds the wrist."""
+        if not self._require_manual_serial():
+            return False
+        if self.motion_runner.is_running or self._rah_mode_ref is not None or self._practice_mode_ref is not None:
+            messagebox.showerror("Error", "Stop the running task before sending manual motor commands.")
             return False
         return True
 
@@ -3005,7 +3633,7 @@ class ExpGUI(tk.Tk):
         self._manual_vel_after_id = self.after(interval_ms, self._manual_velocity_poll, interval_ms)
 
     def on_set_servo(self):
-        if not self._require_manual_serial():
+        if not self._require_manual_idle():
             return
         try:
             gear_ang = float(self.servo_entry.get().strip())
@@ -3101,7 +3729,7 @@ class ExpGUI(tk.Tk):
         self._last_manual_dmp_sent = val
 
     def on_set_torque(self):
-        if not self._require_manual_serial():
+        if not self._require_manual_idle():
             return
         try:
             torque_nmm = float(self.servo_torque_entry.get().strip())
@@ -3120,7 +3748,7 @@ class ExpGUI(tk.Tk):
         self.serial_worker.send(f"SET_TAU:{torque_nm:.5f}")
 
     def on_zero_torque(self):
-        if not self._require_manual_serial():
+        if not self._require_manual_idle():
             return
         try:
             self.servo_torque_entry.delete(0, tk.END)
@@ -3170,8 +3798,11 @@ class ExpGUI(tk.Tk):
             self._rest_t0 = time.perf_counter()
             self._write_log_header({'experiment': 'rest', 'rest_angle_deg': f'{rest_angle:.3f}', 'duration_s': f'{duration:.3f}', 'csv_recording': 'disabled', 'servo_control': 'hold_current_angle_if_exo_connected', 'damper_pwm': '0', **self._optional_hardware_log_fields()})
             self._append_gui_session_log(vicon_base, 'Rest', duration, {'rest_angle_deg': f'{rest_angle:.3f}'})
-            self.motion_runner.start(mode)
+            # Same motor sequence as the other tasks: position mode and torque before the loop.
+            self.serial_worker.send('ZERO_VEL')
+            self.serial_worker.send('MODE_EXT')
             self.serial_worker.send('TORQUE_ON')
+            self.motion_runner.start(mode)
             self._start_session_recording()
             self._emit_marker(0, 1)
             self.motion_status.set(f'REST - servo holding {rest_angle:.1f} deg for {duration:.1f}s')
@@ -3301,9 +3932,11 @@ class ExpGUI(tk.Tk):
                                      "analysis_window_s": f"0.000-{duration:.3f}",
                                      "analysis_rule": "mean of all valid LC samples from 0 s to the configured duration",
                                      "analysis_mean": "pending"})
-            self.motion_runner.start(mode)
+            self.serial_worker.send("ZERO_VEL")
+            self.serial_worker.send("MODE_EXT")
             self.serial_worker.send("TORQUE_ON")
             self.serial_worker.send("SET_DMP:255")
+            self.motion_runner.start(mode)
             self._start_primary_csv(mode)
             self._start_session_recording()
             self.recorder.set_marker(1)
@@ -3417,6 +4050,8 @@ class ExpGUI(tk.Tk):
                 if channel == "Fnorm":
                     vals = [float(row[col_map[k]]) for k in ("Fx", "Fy", "Fz")]
                     val = _math.sqrt(sum(v * v for v in vals))
+                elif channel == "Fxy":
+                    val = _math.hypot(float(row[col_map["Fx"]]), float(row[col_map["Fy"]]))
                 elif channel == "Tnorm":
                     vals = [float(row[col_map[k]]) for k in ("Tx", "Ty", "Tz")]
                     val = _math.sqrt(sum(v * v for v in vals))
@@ -3480,15 +4115,13 @@ class ExpGUI(tk.Tk):
     }
 
     def _update_direction_reversal_marker(self, mode):
+        """Align the CSV marker and the trigger with the mode's phase. The motion thread's phase
+        callback and the Tk loop (fallback) both come here; the marker lock makes that safe."""
         try:
             marker = int(mode.marker_code())
         except Exception:
             marker = 1
-        prev = int(getattr(self.recorder, "current_marker", 0) or 0)
-        if prev == marker:
-            return
-        self.recorder.set_marker(marker)
-        self._emit_marker(prev, marker)
+        self._set_phase_marker(marker)
 
     def direction_reversal_on_start(self):
         if not self._require_experiment_connections():
@@ -3616,9 +4249,14 @@ class ExpGUI(tk.Tk):
             mode.reset()
 
             def _on_phase(_prev, new_phase):
-                if not dynamics_enabled:
+                # Motion thread, at the tick that starts the phase: marker and trigger first,
+                # then the motor commands of the dynamics task. No Tk call here (a Tk call from
+                # this thread blocks it on the GUI); the UI loop shows the status text.
+                if mode is not self._dr_mode_ref:
                     return
-                self.after(0, lambda s=new_phase: self._direction_reversal_on_phase_ui(s))
+                self._update_direction_reversal_marker(mode)
+                if dynamics_enabled:
+                    self._direction_reversal_apply_phase(mode, new_phase)
 
             mode.on_phase_change = _on_phase
             mode.start(wrist_now)
@@ -3639,6 +4277,8 @@ class ExpGUI(tk.Tk):
                 total_duration,
                 gui_log_details,
             )
+            self._stamp_log_launch_time()
+            self._dr_status_text = None
             self._start_primary_csv(mode)
             self._start_session_recording()
             self.recorder.set_marker(1)
@@ -3663,10 +4303,9 @@ class ExpGUI(tk.Tk):
 
         self.display.countdown(_launch)
 
-    def _direction_reversal_on_phase_ui(self, phase: str):
-        mode = self.motion_runner.active_mode
-        if mode is None or mode.name != "direction_reversal":
-            return
+    def _direction_reversal_apply_phase(self, mode, phase: str):
+        """Dynamics task, motion thread: release the wrist for a movement cue, hold it otherwise.
+        Serial sends are thread-safe; the status text is handed to the UI loop."""
         damper = int(round(mode.params.get("damper_pwm", 255)))
         cue = getattr(mode, "current_instruction", "rest")
         if phase == "instruction" and cue in ("extension", "flexion"):
@@ -3675,16 +4314,18 @@ class ExpGUI(tk.Tk):
             self.serial_worker.send("TORQUE_OFF")
             self.serial_worker.send("SET_DMP:0")
             target = mode.target_angle_for_current_instruction() if hasattr(mode, "target_angle_for_current_instruction") else 0.0
-            self.motion_status.set(
-                f"DIRECTION REVERSAL dynamics - {cue}, move toward {target:+.1f} deg")
+            self._dr_status_text = f"DIRECTION REVERSAL dynamics - {cue}, move toward {target:+.1f} deg"
             return
         self.serial_worker.send("TORQUE_ON")
         self.serial_worker.send("SET_DMP:0" if phase == "return" else f"SET_DMP:{damper}")
         if phase == "return":
-            self.motion_status.set(
-                f"DIRECTION REVERSAL dynamics - returning to {mode.hold_pos:+.1f} deg")
+            self._dr_status_text = f"DIRECTION REVERSAL dynamics - returning to {mode.hold_pos:+.1f} deg"
+        else:
+            self._dr_status_text = f"DIRECTION REVERSAL dynamics - {phase} | holding {mode.hold_pos:+.1f} deg"
 
     def direction_reversal_on_stop(self, auto_complete: bool = False):
+        if self._dr_mode_ref is None:
+            return  # already stopped (auto-complete and the Stop button, or pressed twice)
         self._motion_polling = False
         self._unlock_rah_display_lowpass()
         prev_marker = int(getattr(self.recorder, "current_marker", 0) or 0)
@@ -3722,7 +4363,11 @@ class ExpGUI(tk.Tk):
             self.after(100, lambda: self.direction_reversal_on_stop(auto_complete=True))
             return
 
-        self._update_direction_reversal_marker(mode)
+        self._update_direction_reversal_marker(mode)   # fallback; the phase callback has normally done it
+        status_text = self._dr_status_text
+        if status_text:
+            self._dr_status_text = None
+            self.motion_status.set(status_text)
         rows = self._primary_csv_rows()
         elapsed = time.time() - self._dr_t0 if self._dr_t0 else 0.0
         if not mode.dynamics_enabled():
@@ -3806,9 +4451,7 @@ class ExpGUI(tk.Tk):
                 self.recorder.set_marker(float_marker)
                 if prev_m != new_m or (prev_sp == "positioning" and new_sp == "go"):
                     self._emit_marker(prev_m, new_m)
-                total = int(round(mode.params.get("total_reps", 1)))
-                self.after(0, lambda s=new_sp: self.pm_phase_var.set(
-                    f"phase={s}  |  rep={mode.rep+1}/{total}  {start:+g} -> {target:+g} deg"))
+                # Motion thread: no Tk call here; _pm_ui_loop shows the phase text.
 
             self._start_primary_csv(mode)
             self._start_session_recording()
@@ -3830,6 +4473,7 @@ class ExpGUI(tk.Tk):
                     "vel_deg_s": self._compact_gui_log_number(speed),
                 },
             )
+            self._stamp_log_launch_time()
             mode.start_positioning(wrist_now)
             phase = mode.sub_phase
             self.motion_status.set(
@@ -3845,6 +4489,9 @@ class ExpGUI(tk.Tk):
         self.display.countdown(_launch)
 
     def pm_on_stop(self):
+        mode = self.motion_runner.active_mode
+        if mode is None or getattr(mode, "name", "") != "passive_movement":
+            return  # nothing of this task is running (stopped already, or pressed twice)
         self._motion_polling = False
         cur = self.recorder.current_marker
         if cur != 0:
@@ -3880,6 +4527,9 @@ class ExpGUI(tk.Tk):
         total    = int(round(mode.params.get("total_reps", 1)))
         hold_dur = float(mode.params.get("hold_duration_s", 2.0))
         rest_dur = float(mode.params.get("rest_time_s",     2.0))
+        self.pm_phase_var.set(
+            f"phase={mode.sub_phase}  |  rep={min(total, mode.rep + 1)}/{total}  "
+            f"{float(mode.params.get('start_deg', 0.0)):+g} -> {float(mode.params.get('target_deg', 0.0)):+g} deg")
         if mode.sub_phase == "hold":
             remaining = max(0.0, hold_dur - mode.hold_t)
             self.motion_status.set(
@@ -4096,44 +4746,212 @@ class ExpGUI(tk.Tk):
         self.after(interval_ms, self._velocity_test_ui_loop)
 
 
-    def _begin_rah_score_run(self, mode, player_id, duration):
+    def _begin_rah_score_run(self, mode, player_id, duration, stem=''):
+        """Prepare the game for the coming run (called before the countdown): fresh bean state
+        and the bean schedule of this profile. The run is identified by its mode object;
+        ``stem`` (the recording's file stem) names it in the run log. The pickup tolerance of
+        this run (how far the robot may be off the line and still touch a bean, at the subject
+        display's current size) is shown in the status line and kept for the run log."""
         game = self.display._rah_game
-        trial_key = (id(mode), self._rah_t0)
+        trial_key = id(mode)
         game.begin_trial(trial_key)
+        # Bean positions for this run: equal distance along the diagram (ramps as dense as holds).
+        mvc_value = max(0.01, float(mode.params.get('mvc_value', 10.0)))
+        peak_norm = max(mode.target_pct_values(), default=0.0) / 100.0
+        run_duration = float(duration)
+
+        def _profile_y(t_abs):
+            if t_abs < 0 or t_abs > run_duration:
+                return 0.0
+            return max(0.0, float(mode.profile_value(t_abs)) / mvc_value)
+        game.set_schedule(_profile_y, run_duration, peak_norm)
+        unit = 'Nmm' if self.rah_channel_var.get().startswith('T') else 'N'
+        part = (f'inner {int(round(sprites.PICKUP_BODY_FRACTION * 100))} % of the robot'
+                if sprites.PICKUP_BODY_FRACTION < 0.999 else 'robot')
+        part += f' = {RAHCoinGame.PICKUP_PCT_TARGET:g} % of the target'
+        try:
+            # The ramps of this profile (fractions of MVC per second), for the ramp tolerance.
+            step = 0.05
+            slopes = set()
+            t = 0.0
+            while t + step <= run_duration + 1e-9:
+                slope = round((_profile_y(t + step) - _profile_y(t)) / step, 4)
+                if abs(slope) > 1e-6:
+                    slopes.add(slope)
+                t += step
+            above, below, robot_px, coin_px, ramp = self.display.pickup_tolerance(mvc_value, peak_norm, sorted(slopes))
+            pickup = (f'pickup = bean touching the {part}: holds up to +{above:.2f} / -{below:.2f} {unit} off the line'
+                      + (f', ramps up to +{ramp[0]:.2f} / -{ramp[1]:.2f} {unit}' if ramp else '')
+                      + f' (robot {robot_px} px, bean {coin_px} px)')
+        except Exception as exc:
+            above = below = None
+            pickup = f'pickup = bean touching the {part} (tolerance not computed: {exc})'
         self._rah_score_run = {
             'player_id': player_id,
             'trial_key': trial_key,
             'total': game.total_coins(duration),
             'finalized': False,
+            'stem': str(stem or ''),
+            'pickup': pickup,
         }
-        self.rah_score_status_var.set('Score: running...' if player_id else 'Score: no Player ID; this run will not be saved.')
+        self.rah_score_status_var.set(('Score: running...' if player_id else 'Score: no Player ID; this run will not be saved.')
+                                      + ' | ' + pickup)
+
+    def _log_rah_run(self, run, collected, outcome):
+        """One line per RAH run in rah_runs.txt next to the score file: time, recording stem,
+        Player ID, beans, the pickup tolerance of the run and what happened to the leaderboard.
+        Written for every run, whatever the answer to the leaderboard question, so no result
+        is ever lost."""
+        try:
+            path = self.rah_score_store.path.with_name('rah_runs.txt')
+            beans = '-' if collected is None else f"{collected}/{run['total']}"
+            line = (f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {run.get('stem') or '-'}  "
+                    f"player={run['player_id'] or '-'}  beans={beans}  {outcome}  |  {run.get('pickup', '')}\n")
+            with open(path, 'a', encoding='utf-8') as handle:
+                handle.write(line)
+        except OSError as exc:
+            print(f"[RAH run log] write failed: {exc}", flush=True)
+
+    def _ask_add_run_to_leaderboard(self, player_id, collected, total, previous, sticker):
+        """Modal question in the operator GUI after a complete run: add this run's beans to
+        the player's leaderboard total? Closing the box counts as No. The recording and the
+        run log are saved before this is asked and whatever the answer."""
+        percent = 100.0 * collected / total if total else 0.0
+        record = previous[0] if previous else None
+        if record is not None:
+            effect = (f"Yes: {player_id}'s total becomes {record.collected + collected}/{record.total + total} "
+                      f"(now {record.collected}/{record.total})")
+        else:
+            effect = f"Yes: {player_id} joins the board with {collected}/{total}"
+        if sticker:
+            effect += f" and gets a sticker ({int(round(STICKER_FRACTION * 100))} % or more of the beans)"
+        message = (f"{player_id}: {collected} / {total} beans this run ({percent:.0f} %)"
+                   + ("  -  WINNER RUN" if sticker else "") + ".\n\n"
+                   "Add this run to the leaderboard?\n"
+                   f"{effect}.\nNo: the leaderboard stays as it is.\n\n"
+                   "The recording and the run log are saved either way.")
+        return bool(messagebox.askyesno('Add to the leaderboard?', message, parent=self, default=messagebox.YES))
+
+    def _write_rah_game_files(self, run):
+        """What the game saw, next to the run's recording files (root and subfolder):
+        <stem>_beans.csv = one row per judged bean (time, target, displayed force, error, the
+        tolerance above/below in force units, collected 1/0, when it was judged) and
+        <stem>_display.csv = the displayed force (raw and filtered) at every history sample.
+        Written for complete and stopped runs alike; never touches the recorders."""
+        stem = run.get('stem') or ''
+        if not stem or not getattr(self, '_log_path', ''):
+            return
+        try:
+            game = self.display._rah_game
+            mvc = max(0.01, self._parse_float(self.rah_limit_var, 10.0))
+            unit = 'Nmm' if self.rah_channel_var.get().startswith('T') else 'N'
+            px_per_norm = float(game.px_per_norm or 0.0)
+            scale = mvc / px_per_norm if px_per_norm > 0 else float('nan')
+            bean_rows = []
+            for index in sorted(game.verdicts):
+                t_coin, force, target, offset, lo, hi, collected, judged_at = game.verdicts[index]
+                bean_rows.append([
+                    index, f'{t_coin:.3f}', f'{target * mvc:.4f}',
+                    '' if force is None else f'{force * mvc:.4f}',
+                    '' if force is None else f'{(force - target) * mvc:.4f}',
+                    '' if hi is None else f'{hi * scale:.4f}',
+                    '' if lo is None else f'{-lo * scale:.4f}',
+                    int(bool(collected)), f'{judged_at:.3f}',
+                ])
+            folders = {os.path.dirname(self._log_path), os.path.dirname(getattr(self, '_log_path_sub', '') or self._log_path)}
+            for folder in folders:
+                if not folder or not os.path.isdir(folder):
+                    continue
+                with open(os.path.join(folder, f'{stem}_beans.csv'), 'w', newline='', encoding='utf-8') as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(['bean', 'time_s', f'target_{unit}', f'displayed_{unit}', f'error_{unit}',
+                                     f'tolerance_above_{unit}', f'tolerance_below_{unit}', 'collected', 'judged_at_s'])
+                    writer.writerows(bean_rows)
+                with open(os.path.join(folder, f'{stem}_display.csv'), 'w', newline='', encoding='utf-8') as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(['time_s', f'raw_{unit}', f'displayed_{unit}'])
+                    writer.writerows([f'{t:.4f}', f'{raw * mvc:.4f}', f'{shown * mvc:.4f}'] for t, raw, shown in self._rah_display_log)
+        except Exception as exc:
+            print(f"[RAH game files] write failed: {exc}", flush=True)
 
     def _finish_rah_score_run(self, completed):
         run = self._rah_score_run
         if run is None or run['finalized']:
             return
         run['finalized'] = True
+        self._write_rah_game_files(run)
         if not completed:
             self.rah_score_status_var.set('Score not saved: RAH stopped before completion.')
+            self._log_rah_run(run, None, 'stopped before completion: not added to the leaderboard')
             return
-        if not run['player_id']:
-            self.rah_score_status_var.set('Score not saved: no Player ID.')
-            return
+        player_id = run['player_id']
+        last_run = {'player_id': player_id, 'collected': None, 'total': run['total'],
+                    'saved': False, 'first': False, 'record': None, 'best': None, 'note': '', 'perfect_runs': 0}
         try:
             game = self.display._rah_game
             if game.trial_key != run['trial_key']:
                 raise ValueError('The collected coins do not belong to this RAH run.')
-            collected = sum(1 for second in game.collected if 1 <= second <= run['total'])
-            record = self.rah_score_store.append(run['player_id'], collected, run['total'])
-        except (OSError, ValueError) as exc:
+            collected = sum(1 for index in game.collected if 1 <= index <= run['total'])
+            last_run['collected'] = collected
+            sticker = earns_sticker(collected, run['total'])
+            tag = ' (sticker run!)' if sticker else ''
+            if not player_id:
+                self.rah_score_status_var.set('Score not saved: no Player ID.' + tag)
+                last_run['note'] = 'not saved: no Player ID was entered'
+                self._log_rah_run(run, collected, 'no Player ID: not added to the leaderboard')
+            else:
+                previous = self.rah_score_store.read(player_id=player_id)
+                add = True
+                if RAH_LEADERBOARD_CONFIRM:
+                    # The participant sees the result at once; the board changes only after the
+                    # operator has answered (the recording is already saved at this point).
+                    self._show_leaderboard_on_display(
+                        dict(last_run, note='not on the board yet: the operator decides'))
+                    self.rah_score_status_var.set(f'This run {collected}/{run["total"]}: add to the leaderboard?')
+                    add = self._ask_add_run_to_leaderboard(player_id, collected, run['total'], previous, sticker)
+                if add:
+                    # The run's beans are added to the player's running total (collected / possible);
+                    # a sticker run also adds one sticker (perfect_runs) to the player's line.
+                    record = self.rah_score_store.append(player_id, collected, run['total'])
+                    total_text = f'{record.collected}/{record.total} ({record.percent:.1f}%)'
+                    last_run.update(saved=True, record=record, best=record, first=not previous,
+                                    perfect_runs=record.perfect_runs)
+                    if sticker:
+                        self.rah_score_status_var.set(
+                            f'WINNER RUN saved: this run {collected}/{run["total"]} | total {total_text} | stickers: {record.perfect_runs}')
+                    else:
+                        self.rah_score_status_var.set(
+                            f'Saved: this run {collected}/{run["total"]} | total {total_text}')
+                    self._log_rah_run(run, collected, f'added to the leaderboard: total {record.collected}/{record.total}'
+                                      + (f' stickers={record.perfect_runs}' if record.perfect_runs else ''))
+                else:
+                    self.rah_score_status_var.set(
+                        f'Not added to the leaderboard: this run {collected}/{run["total"]}' + tag)
+                    last_run['note'] = 'not added to the leaderboard'
+                    self._log_rah_run(run, collected, 'not added to the leaderboard (operator)')
+        except (OSError, UnicodeError, ValueError) as exc:
             self.rah_score_status_var.set('Score not saved: file write failed.')
+            last_run['note'] = 'not saved: the score file could not be written'
             messagebox.showerror('RAH score not saved', f'Could not save the completed score to:\n{self.rah_score_store.path}\n\n{exc}', parent=self)
-            return
-        best_text = f'{record.line()} ({record.percent:.1f}%)'
-        if (record.collected, record.total) == (collected, run['total']):
-            self.rah_score_status_var.set(f'Best saved: {best_text}')
-        else:
-            self.rah_score_status_var.set(f'Run: {collected}/{run["total"]}, {collected} points | Best kept: {best_text}')
+        # The participant sees the standings as soon as the run is over.
+        self._show_leaderboard_on_display(last_run)
+
+    def _show_leaderboard_on_display(self, last_run=None):
+        """Overlay the standings on the subject display: after every completed RAH run, or on request."""
+        display = getattr(self, 'display', None)
+        try:
+            if display is None or not display.winfo_exists():
+                return
+            records = self.rah_score_store.read()
+            highlight = (last_run or {}).get('player_id') or self.rah_player_id_var.get().strip() or None
+            display.show_leaderboard(records, highlight=highlight, last_run=last_run)
+        except Exception as exc:
+            self.rah_score_status_var.set(f'Leaderboard not shown: {exc}')
+
+    def _hide_leaderboard_on_display(self):
+        display = getattr(self, 'display', None)
+        if display is not None and display.winfo_exists():
+            display.hide_leaderboard()
 
     def _show_rah_scores(self):
         player_id = self.rah_player_id_var.get().strip()
@@ -4145,9 +4963,195 @@ class ExpGUI(tk.Tk):
         if not records:
             messagebox.showinfo('RAH Scores', 'No completed scores found for this Player ID.' if player_id else 'No completed RAH scores yet.', parent=self)
             return
-        lines = ['Player ID | Collected/Total | Best score', ''] + [record.line() for record in records[-20:]]
-        lines += ['', 'Showing up to 20 personal bests.', str(self.rah_score_store.path)]
+        lines = [f'Player ID | Collected/Total over all complete runs | Points | perfect=stickers (runs with {int(round(STICKER_FRACTION * 100))} % or more of the beans)', ''] + [record.line() for record in records[-20:]]
+        lines += ['', 'Showing up to 20 players.', str(self.rah_score_store.path)]
         messagebox.showinfo('RAH Scores', '\n'.join(lines), parent=self)
+
+    # ---- RAH practice: unrecorded warm-up before a run --------------------------------
+    _PRACTICE_HISTORY_MAXLEN = 1000
+
+    def rah_practice_on_start(self):
+        """Hold the wrist like a run and show the robot from 0 to the practice top; save nothing.
+
+        No recorder, marker, trigger pulse, Vicon capture, GUI log row or score is touched.
+        """
+        if self._rah_mode_ref is not None or getattr(self, '_motion_polling', False) or self._rah_countdown_active:
+            messagebox.showerror('RAH running', 'Stop the current run before starting a practice.', parent=self)
+            return
+        if self._practice_mode_ref is not None:
+            return
+        if not self.serial_worker.connected:
+            messagebox.showerror('Error', 'Connect Exo Serial first.', parent=self)
+            return
+        if not self.lc_worker.connected:
+            messagebox.showerror('Error', 'Connect Load Cell first.', parent=self)
+            return
+        if self.motion_runner.is_running:
+            messagebox.showerror('Motion running', 'Stop the current motion mode before starting a practice.', parent=self)
+            return
+        mvc_value = self._parse_float(self.rah_limit_var, 0.0)
+        if not (_math.isfinite(mvc_value) and mvc_value > 0.0):
+            messagebox.showerror('Invalid MVC', 'Enter a positive MVC value in the RAH parameters first.', parent=self)
+            return
+        top_pct = self._parse_float(self.rah_practice_top_var, 0.0)
+        if not (_math.isfinite(top_pct) and 1.0 <= top_pct <= 100.0):
+            messagebox.showerror('Invalid practice top', 'Top of screen must be between 1 and 100 % MVC.', parent=self)
+            return
+        channel = self.rah_channel_var.get()
+        direction = self._direction_choice_to_sign(self.rah_direction_var.get())
+        mode = RAHPracticeMode(direction=direction, mvc_value=mvc_value, top_pct=top_pct)
+        mode.set_handedness(1 if self.handedness_var.get() == 'Right' else -1)
+        mode.reset()
+        self._practice_cfg = {'mvc_value': mvc_value, 'top_pct': top_pct, 'channel': channel, 'direction': direction}
+        self._practice_history = []
+        self._practice_top_hits = 0
+        self._practice_at_top = False
+        self._lock_rah_display_lowpass()
+        self._reset_rah_display_filter()
+        self.display.hide_leaderboard()
+        wrist_now = self._get_wrist()
+        # Same motor hold as a run (position mode, torque on, damper 255).
+        self.serial_worker.send('ZERO_VEL')
+        self.serial_worker.send('MODE_EXT')
+        self.serial_worker.send('TORQUE_ON')
+        self.serial_worker.send('SET_DMP:255')
+        mode.start(wrist_now)
+        self.motion_runner.start(mode, reset=False)
+        self._practice_mode_ref = mode
+        self._practice_t0 = time.time()
+        self._practice_polling = True
+        self.rah_btn_practice.config(state='disabled')
+        self.rah_btn_practice_stop.config(state='normal')
+        self.motion_status.set(f'RAH practice (not recorded) | top of screen = {top_pct:g}% MVC | {channel} | hold={wrist_now:.1f} deg')
+        self._practice_ui_loop()
+
+    def rah_practice_on_stop(self, keep_torque: bool = False):
+        """End the practice. keep_torque=True leaves the wrist held (Start of a run follows)."""
+        if self._practice_mode_ref is None:
+            return
+        self._practice_polling = False
+        try:
+            self.motion_runner.stop(release=False)
+        except Exception:
+            pass
+        if not keep_torque:
+            self.serial_worker.send('TORQUE_OFF')
+            self.serial_worker.send('SET_DMP:0')
+        self._unlock_rah_display_lowpass()
+        self._practice_mode_ref = None
+        self._practice_t0 = None
+        self.rah_btn_practice.config(state='normal')
+        self.rah_btn_practice_stop.config(state='disabled')
+        self.motion_status.set('Idle')
+        self.rah_phase_var.set('-')
+        self._draw_rah_canvas_idle()
+
+    def practice_display_state(self):
+        """What the subject display draws during a practice; None when no practice runs."""
+        if self._practice_mode_ref is None or self._practice_cfg is None:
+            return None
+        cfg = self._practice_cfg
+        return {'history': self._practice_history,
+                't_now': time.time() - self._practice_t0 if self._practice_t0 else 0.0,
+                'mvc_value': cfg['mvc_value'], 'channel': cfg['channel'], 'top_pct': cfg['top_pct'],
+                'top_hits': self._practice_top_hits, 'at_top': self._practice_at_top}
+
+    def _practice_ui_loop(self, interval_ms=100):
+        if not self._practice_polling or self._practice_mode_ref is None:
+            return
+        cfg = self._practice_cfg
+        (lc_sample, sample_ts) = self.lc_worker.ring.get_latest()
+        t_elapsed = time.time() - self._practice_t0 if self._practice_t0 else 0.0
+        if lc_sample and len(lc_sample) >= 6:
+            raw_val = self._lc_rah_value(lc_sample, cfg['channel'])
+            if cfg['channel'] in self._UNSIGNED_LC_CHANNELS:
+                norm_val = abs(raw_val) / cfg['mvc_value']
+            else:
+                norm_val = raw_val * self._rah_lc_direction_sign(cfg['channel'], cfg['direction']) / cfg['mvc_value']
+            shown = norm_val
+            if self._rah_display_lowpass_enabled():
+                try:
+                    shown = self._rah_display_filter.update(norm_val, time.perf_counter() if sample_ts is None else sample_ts)
+                except (ValueError, OverflowError):
+                    self._rah_display_filter.reset()
+            self._practice_history.append((t_elapsed, shown))
+            if len(self._practice_history) > self._PRACTICE_HISTORY_MAXLEN:
+                del self._practice_history[0]
+            top = cfg['top_pct'] / 100.0
+            if shown >= top - 1e-9:
+                if not self._practice_at_top:
+                    self._practice_top_hits += 1
+                self._practice_at_top = True
+            elif shown < 0.8 * top:
+                self._practice_at_top = False
+        self.rah_phase_var.set(f'practice (not recorded) | t={t_elapsed:.0f}s | top reached {self._practice_top_hits}x')
+        self._practice_ui_ticks = getattr(self, '_practice_ui_ticks', 0) + 1
+        if self._practice_ui_ticks % 2 == 0:
+            self._draw_practice_live()
+        self.after(interval_ms, self._practice_ui_loop)
+
+    def _draw_practice_live(self):
+        """Operator copy of the practice view: trace, current value and the top line."""
+        c = self.rah_canvas
+        (W, H) = self._rah_canvas_size()
+        c.delete('all')
+        state = self.practice_display_state()
+        if state is None:
+            return
+        (ML, MR, MT, MB) = (50, 10, 15, 30)
+        (PW, PH) = (max(1, W - ML - MR), max(1, H - MT - MB))
+        WIN_S = 15.0
+        t_now = state['t_now']
+        t_left = t_now - WIN_S / 3.0
+        t_right = t_left + WIN_S
+        top = max(0.01, state['top_pct'] / 100.0)
+        mvc_value = state['mvc_value']
+        channel = state['channel']
+        unit = 'Nmm' if channel.startswith('T') else 'N'
+
+        def _xpx(t_abs):
+            return int(ML + (t_abs - t_left) / WIN_S * PW)
+
+        pad = 16  # keeps the top line clear of the plot edge
+        axis_min = -0.12 * top
+
+        def _ypx(norm_val):
+            value = max(axis_min, min(top, norm_val))
+            return int(MT + pad + (top - value) / (top - axis_min) * (PH - pad))
+        c.create_rectangle(ML, MT, ML + PW, MT + PH, fill='#0d1117', outline='#1e2a3a')
+        for frac in (0.25, 0.5, 0.75):
+            yg = _ypx(top * frac)
+            c.create_line(ML, yg, ML + PW, yg, fill='#1a2535', width=1)
+            c.create_text(ML - 4, yg, text=f'{top * frac * mvc_value:.1f}', anchor='e', fill='#445566', font=('Segoe UI', 7))
+        y_zero = _ypx(0.0)
+        c.create_line(ML, y_zero, ML + PW, y_zero, fill='#8aadb9', width=2)
+        c.create_text(ML - 4, y_zero, text='0', anchor='e', fill='#8aadb9', font=('Segoe UI', 7))
+        y_top = _ypx(top)
+        c.create_line(ML, y_top, ML + PW, y_top, fill='#00e676', width=2, dash=(6, 4))
+        c.create_text(ML + PW - 2, y_top + 10, text=f'top = {top * 100:g}% MVC ({top * mvc_value:.1f}{unit})', anchor='e', fill='#00e676', font=('Segoe UI', 8, 'bold'))
+        c.create_text(ML - 4, y_top, text=f'{top * mvc_value:.1f}', anchor='e', fill='#00e676', font=('Segoe UI', 7))
+        c.create_text(12, MT + PH // 2, text=f'{channel}\n{unit}', fill='#445566', font=('Segoe UI', 8), angle=90)
+        t_tick = int(t_left // 5) * 5
+        while t_tick <= t_right + 0.01:
+            x = _xpx(t_tick)
+            if ML <= x <= ML + PW:
+                c.create_line(x, MT + PH, x, MT + PH + 4, fill='#445566')
+                c.create_text(x, MT + PH + 14, text=f'{int(t_tick)}s', fill='#445566', font=('Segoe UI', 7))
+            t_tick += 5
+        x_now = _xpx(t_now)
+        c.create_line(x_now, MT, x_now, MT + PH, fill='#555', width=1, dash=(4, 4))
+        coords = []
+        for (t_s, nv) in state['history']:
+            if t_left <= t_s <= t_right:
+                coords.extend([_xpx(t_s), _ypx(nv)])
+        if len(coords) >= 4:
+            c.create_line(*coords, fill='#00e676', width=2, smooth=True, splinesteps=12)
+        if len(coords) >= 2:
+            c.create_oval(coords[-2] - 5, coords[-1] - 5, coords[-2] + 5, coords[-1] + 5, fill='#00e676', outline='white', width=1)
+        current = state['history'][-1][1] if state['history'] else None
+        now_text = '---' if current is None else f'{current * 100:.0f}% MVC'
+        c.create_text(ML, 8, text='PRACTICE (not recorded)', anchor='w', fill='#aaa', font=('Segoe UI', 9, 'bold'))
+        c.create_text(ML + PW, 8, text=f'now {now_text} | top reached {state["top_hits"]}x', anchor='e', fill='#ffe39a', font=('Segoe UI', 9, 'bold'))
 
     def rah_on_start(self):
         if not self._require_experiment_connections():
@@ -4164,6 +5168,9 @@ class ExpGUI(tk.Tk):
         if generated is None or generated.get('signature') != config.get('signature'):
             messagebox.showerror('Generate diagram first', 'The RAH settings changed. Generate the diagram again before starting.')
             return
+        if self._practice_mode_ref is not None:
+            # The unrecorded warm-up ends here; the wrist stays held through the countdown.
+            self.rah_practice_on_stop(keep_torque=True)
         direction_choice = config['direction_choice']
         direction = self._direction_choice_to_sign(direction_choice)
         mvc_value = config['mvc_value']
@@ -4203,10 +5210,16 @@ class ExpGUI(tk.Tk):
         phase_var = self.rah_phase_var
         start_btn.config(state='disabled')
         stop_btn.config(state='disabled')
+        self.rah_btn_practice.config(state='disabled')
         self.rah_player_id_entry.config(state='disabled')
         self.motion_status.set(f'{display_name} - starting in 3...')
+        # Everything that can be prepared before the countdown is prepared now (bean schedule,
+        # score run), so the launch itself only starts the recorders and the motion loop.
+        self._begin_rah_score_run(mode, player_id, total_duration, stem=stem)
+        self._rah_countdown_active = True
 
         def _launch():
+            self._rah_countdown_active = False
             wrist_now = self._get_wrist()
             gui_details = {'mvc_value': f'{mvc_value:.3f}', 'mvc_pct': f'{target_pct:.3f}', 'diagram_schedule': profile_schedule_log, 'lc_channel': channel, 'reps': total_reps, 'wrist_angle_deg': f'{wrist_now:.3f}'}
             if hold_step_active:
@@ -4214,22 +5227,24 @@ class ExpGUI(tk.Tk):
             extra_headers = None
             extra_provider = None
             self._append_gui_session_log(vicon_base, display_name, total_duration, gui_details)
-            self._start_primary_csv(mode, extra_headers=extra_headers, extra_row_provider=extra_provider)
-            self._start_session_recording()
-            self.recorder.set_marker(1)
-            self._emit_marker(0, 1)
-            self._rah_t0 = time.time()
+            self._stamp_log_launch_time()
+            self._rah_t0 = None   # the run clock starts at the first motion tick (phase callback)
             self._rah_start_wrist_deg = wrist_now
             self._rah_history = []
+            self._rah_last_sample_ts = None
+            self._rah_display_log = []
             self._reset_rah_display_filter()
             self._rah_mode_ref = mode
-            self._begin_rah_score_run(mode, player_id, total_duration)
+            # Markers and triggers come from the motion thread at the tick that starts each phase.
+            mode.on_phase_change = lambda prev, new, m=mode: self._on_rah_phase_change(m, prev, new)
+            self._start_primary_csv(mode, extra_headers=extra_headers, extra_row_provider=extra_provider)
+            self._start_session_recording()
             self.serial_worker.send('ZERO_VEL')
             self.serial_worker.send('MODE_EXT')
             self.serial_worker.send('TORQUE_ON')
             self.serial_worker.send('SET_DMP:255')
             mode.start(wrist_now)
-            self.motion_runner.start(mode, reset=False)
+            self.motion_runner.start(mode, reset=False)   # first tick: marker 1 + trigger code 1
             self.motion_status.set(f'{display_name} - custom schedule | peak={target_pct:.1f}% MVC | duration={total_duration:g}s')
             phase_var.set(f'trial 1/{total_reps} | t=0/{total_duration:g}s')
             self.rec_status_var.set(self._session_record_status('Recording'))
@@ -4268,6 +5283,8 @@ class ExpGUI(tk.Tk):
         self.rec_status_var.set(self._session_record_status('Saved', rows))
         self.rah_btn_start.config(state='normal' if self._rah_diagram_ready() else 'disabled')
         self.rah_btn_stop.config(state='disabled')
+        self.rah_btn_practice.config(state='normal')
+        self._rah_countdown_active = False
         self.rah_player_id_entry.config(state='normal')
         self._draw_rah_canvas_idle()
         self._rah_start_wrist_deg = None
@@ -4283,16 +5300,16 @@ class ExpGUI(tk.Tk):
             self.after(interval_ms, self._rah_ui_loop)
             return
         if mode.done:
-            prev_marker = int(getattr(self.recorder, 'current_marker', 0) or 0)
-            if prev_marker not in (0, 4):
-                self.recorder.set_marker(4)
-                self._emit_marker(prev_marker, 4)
+            self._set_phase_marker(4, skip_if_prev_in=(0,))   # normally done already by the phase callback
             self.after(100, lambda: self.rah_on_stop(auto_complete=True) if self._rah_mode_ref is mode else None)
             return
-        self._update_rah_phase_marker(mode)
+        if self._rah_t0 is not None:
+            self._update_rah_phase_marker(mode)   # fallback; the phase callback has normally done it
         (lc_sample, sample_ts) = self.lc_worker.ring.get_latest()
         t_elapsed = time.time() - self._rah_t0 if self._rah_t0 else 0.0
-        self._draw_rah_live(lc_sample, t_elapsed, sample_ts=sample_ts)
+        # Data every tick; the operator plot only every other tick to keep this loop light.
+        self._rah_ui_ticks = getattr(self, '_rah_ui_ticks', 0) + 1
+        self._draw_rah_live(lc_sample, t_elapsed, sample_ts=sample_ts, draw=(self._rah_ui_ticks % 2 == 0))
         rows = self._primary_csv_rows()
         total_reps = int(round(float(mode.params.get('total_reps', 3))))
         total_duration = mode.total_duration() if hasattr(mode, 'total_duration') else 0.0
@@ -4391,10 +5408,7 @@ class ExpGUI(tk.Tk):
                 if new_sp in ('go', 'return') and prev_sp in ('idle', 'positioning'):
                     self.serial_worker.send('TORQUE_OFF')
                     self.serial_worker.send(f'SET_DMP:{damper}')
-                (rep, total) = self._follow_display_rep_info(mode)
-                self.after(0, lambda s=new_sp, r=rep, n=total: self.follow_phase_var.set(f'phase={s}  |  rep={r}/{n}'))
-                if new_sp == 'done':
-                    self.after(200, self.follow_on_stop)
+                # Motion thread: no Tk call here; _follow_ui_loop shows the phase and ends the run.
             self._start_primary_csv(mode)
             self._start_session_recording()
             self.motion_runner.start(mode)
@@ -4404,6 +5418,7 @@ class ExpGUI(tk.Tk):
             wrist_now = self._get_wrist()
             planned_duration = self._follow_planned_duration(path_segments, hold, rest, wrist_now, start, speed)
             self._append_gui_session_log(vicon_base, 'Voluntary Movement', planned_duration, self._follow_gui_log_details(change_mode, total_reps, start, target, speed, path_segments))
+            self._stamp_log_launch_time()
             mode.start_positioning(wrist_now)
             phase = mode.sub_phase
             first_target = mode.current_target() if hasattr(mode, 'current_target') else target
@@ -4417,6 +5432,9 @@ class ExpGUI(tk.Tk):
         self.display.countdown(_launch)
 
     def follow_on_stop(self):
+        mode = self.motion_runner.active_mode
+        if mode is None or getattr(mode, "name", "") != "follow":
+            return  # nothing of this task is running (stopped already, or pressed twice)
         self._motion_polling = False
         cur = self.recorder.current_marker
         if cur != 0:
@@ -4445,8 +5463,12 @@ class ExpGUI(tk.Tk):
             self.after(interval_ms, self._follow_ui_loop)
             return
 
+        if mode.done:
+            self.after(200, self.follow_on_stop)
+            return
         wrist = self._get_wrist()
         rep, total = self._follow_display_rep_info(mode)
+        self.follow_phase_var.set(f"phase={mode.sub_phase}  |  rep={rep}/{total}")
         hold_dur = float(mode.params.get("hold_time_s", 2.0))
         rest_dur = float(mode.params.get("rest_time_s", 2.0))
         target = mode.current_target() if hasattr(mode, "current_target") else float(mode.params.get("target_deg", 30.0))
@@ -4608,7 +5630,8 @@ class ExpGUI(tk.Tk):
             f"VOLUNTARY MOVE  |  {start:+.1f} -> {target:+.1f} deg  guide={mode.green_pos:.1f} deg  wrist={wrist:.1f} deg")
 
     # RAH canvas
-    _RAH_HISTORY_MAXLEN = 1000
+    _RAH_HISTORY_MAXLEN = 2000          # display history length (samples): 20 s at the thinned ~100 Hz of a run
+    _RAH_HISTORY_MIN_STEP_S = 0.009     # a RAH run keeps at most one sample per 9 ms, whatever the LC rate
 
     def _on_rah_canvas_configure(self, _event=None):
         if not getattr(self, '_motion_polling', False) and self._current_tab_text() in ('RAH_LC',):
@@ -4648,6 +5671,7 @@ class ExpGUI(tk.Tk):
             except (ValueError, OverflowError):
                 self._rah_display_filter.reset()
         self._rah_display_values[elapsed] = filtered
+        self._rah_display_log.append((elapsed, value, filtered))
 
     def _lock_rah_display_lowpass(self):
         self._rah_display_lowpass_active = bool(self.rah_display_lowpass_var.get())
@@ -4729,6 +5753,8 @@ class ExpGUI(tk.Tk):
             return 0.0
         if channel == "Fnorm":
             return _math.sqrt(sum(sample[i]**2 for i in range(3)))
+        if channel == "Fxy":
+            return _math.hypot(sample[0], sample[1])
         if channel == "Tnorm":
             return _math.sqrt(sum(sample[i]**2 for i in range(3, 6)))
         ch_idx = {"Fx": 0, "Fy": 1, "Fz": 2, "Tx": 3, "Ty": 4, "Tz": 5}
@@ -4743,10 +5769,72 @@ class ExpGUI(tk.Tk):
             return -hand_sign * direction_sign
         return direction_sign
 
-    def _draw_rah_live(self, lc_sample, t_elapsed, sample_ts=None):
+    def _rah_norm_value(self, lc_sample, channel, mvc_value, desired_sign, direction, is_dr_force):
+        """One LC sample as the displayed fraction of MVC of the feedback channel."""
+        raw_val = self._lc_rah_value(lc_sample, channel)
+        if is_dr_force and channel in self._UNSIGNED_LC_CHANNELS:
+            return abs(raw_val) * direction / mvc_value
+        if channel in self._UNSIGNED_LC_CHANNELS:
+            return abs(raw_val) / mvc_value
+        # Signed: pulling the wrong way shows below the baseline instead of sitting on it.
+        return raw_val * desired_sign / mvc_value
+
+    def _trim_rah_history(self):
+        while len(self._rah_history) > self._RAH_HISTORY_MAXLEN:
+            expired_t, _value = self._rah_history.pop(0)
+            self._rah_display_values.pop(expired_t, None)
+
+    def _update_rah_history(self):
+        """Append every LC sample received since the last call to the RAH display history, each
+        at its own trial time (thinned to one per _RAH_HISTORY_MIN_STEP_S) and through the
+        display filter. The operator loop and the subject display both call this (Tk thread)
+        before they read the history, so the character and the bean verdicts always use the
+        force up to that moment instead of one sample per GUI tick. Nothing here is recorded:
+        the recorders read the LC ring themselves."""
+        mode = self.motion_runner.active_mode
+        if mode is None or getattr(mode, 'name', '') != 'ramp_and_hold':
+            return
+        if not hasattr(self, '_rah_history'):
+            self._rah_history = []
+        ring = self.lc_worker.ring
+        t0 = self._rah_t0
+        if t0 is None:
+            # The run clock has not started yet: the samples so far belong to before the run.
+            _latest, latest_ts = ring.get_latest()
+            if latest_ts is not None:
+                self._rah_last_sample_ts = latest_ts
+            return
+        last_ts = self._rah_last_sample_ts
+        if last_ts is None:
+            last_ts = time.perf_counter() - 0.2
+        frames = ring.get_since(last_ts)
+        if not frames:
+            return
+        channel = self.rah_channel_var.get()
+        mvc_value = max(0.01, self._parse_float(self.rah_limit_var, 10.0))
+        direction = int(round(mode.params.get('direction', 1)))
+        desired_sign = self._rah_lc_direction_sign(channel, direction)
+        now_wall, now_perf = time.time(), time.perf_counter()
+        history = self._rah_history
+        last_kept = history[-1][0] if history else None
+        for sample_ts, sample in frames:
+            self._rah_last_sample_ts = sample_ts
+            if not sample or len(sample) < 6:
+                continue
+            t_elapsed = (now_wall - t0) - (now_perf - sample_ts)
+            if t_elapsed < 0.0 or (last_kept is not None and t_elapsed - last_kept < self._RAH_HISTORY_MIN_STEP_S):
+                continue
+            norm_val = self._rah_norm_value(sample, channel, mvc_value, desired_sign, direction, False)
+            history.append((t_elapsed, norm_val))
+            self._record_rah_display_value(t_elapsed, norm_val, sample_ts)
+            last_kept = t_elapsed
+        self._trim_rah_history()
+
+    def _draw_rah_live(self, lc_sample, t_elapsed, sample_ts=None, draw=True):
+        """Bring the display history up to date (every LC sample during a RAH run, the latest
+        sample otherwise) and (when ``draw``) redraw the operator plot."""
         c = self.rah_canvas
         (W, H) = self._rah_canvas_size()
-        c.delete('all')
         mode = self.motion_runner.active_mode
         is_dr_force = mode is not None and getattr(mode, 'name', '') == 'direction_reversal' and hasattr(mode, 'dynamics_enabled') and (not mode.dynamics_enabled())
         if is_dr_force:
@@ -4776,22 +5864,16 @@ class ExpGUI(tk.Tk):
         t_right = t_left + WIN_S
         if not hasattr(self, '_rah_history'):
             self._rah_history = []
-        if lc_sample and len(lc_sample) >= 6:
-            raw_val = self._lc_rah_value(lc_sample, channel)
-            if is_dr_force and channel in ('Fnorm', 'Tnorm'):
-                norm_val = abs(raw_val) * direction / mvc_value
-            elif channel in ('Fnorm', 'Tnorm'):
-                norm_val = abs(raw_val) / mvc_value
-            elif is_dr_force:
-                norm_val = raw_val * desired_sign / mvc_value
-            else:
-                norm_val = max(0.0, raw_val * desired_sign / mvc_value)
+        if mode is not None and getattr(mode, 'name', '') == 'ramp_and_hold':
+            # A RAH run keeps every LC sample (the game judges the beans on them), not one per tick.
+            self._update_rah_history()
+        elif lc_sample and len(lc_sample) >= 6:
+            norm_val = self._rah_norm_value(lc_sample, channel, mvc_value, desired_sign, direction, is_dr_force)
             self._rah_history.append((t_elapsed, norm_val))
-            if mode is not None and getattr(mode, 'name', '') == 'ramp_and_hold':
-                self._record_rah_display_value(t_elapsed, norm_val, sample_ts)
-            if len(self._rah_history) > self._RAH_HISTORY_MAXLEN:
-                expired_t, _value = self._rah_history.pop(0)
-                self._rah_display_values.pop(expired_t, None)
+            self._trim_rah_history()
+        if not draw:
+            return
+        c.delete('all')
         visible_history = [(t_s, nv) for (t_s, nv) in self._rah_history if t_left <= t_s <= t_right]
         if is_dr_force:
             (y_axis_min, y_axis_max) = (-1.0, 1.0)
@@ -4799,7 +5881,8 @@ class ExpGUI(tk.Tk):
             max_target_norm = target_norm
             if mode is not None and hasattr(mode, 'target_pct_values'):
                 max_target_norm = max(max_target_norm, max(mode.target_pct_values()) / 100.0)
-            (y_axis_min, y_axis_max) = (0.0, max(0.01, max_target_norm * 1.25))
+            y_axis_max = max(0.01, max_target_norm * 1.25)
+            (y_axis_min, y_axis_max) = (-0.12 * y_axis_max, y_axis_max)
         y_axis_span = y_axis_max - y_axis_min
 
         def _xpx(t_abs):
@@ -4869,6 +5952,13 @@ class ExpGUI(tk.Tk):
         x_now = _xpx(t_elapsed)
         c.create_line(x_now, MT, x_now, MT + PH, fill='#555', width=1, dash=(4, 4))
         draw_history = self._smooth_history_for_display(visible_history)
+        if len(draw_history) > 300:
+            # The operator trace needs no more than ~300 points (a RAH history holds every LC sample).
+            step = len(draw_history) // 300 + 1
+            trace = draw_history[::step]
+            if trace[-1] is not draw_history[-1]:
+                trace.append(draw_history[-1])
+            draw_history = trace
         if len(draw_history) >= 2:
             coords = []
             for (t_s, nv) in draw_history:
@@ -4893,15 +5983,20 @@ class ExpGUI(tk.Tk):
         c.create_text(W // 2, 8, text=title, fill='#aaa', font=('Segoe UI', 9, 'bold'))
 
     # LC Monitor canvas
+    # (index, signed, unit). Derived channels are unsigned: Fnorm = |F|, Tnorm = |T| and
+    # Fxy = sqrt(Fx^2 + Fy^2), the force in the Fx/Fy plane with Fz left out.
     _LC_CHANNELS = {
         "Fx":    (0, True,  "N"),  "Fy":    (1, True,  "N"),  "Fz":    (2, True,  "N"),
         "Tx":    (3, True,  "Nmm"), "Ty":    (4, True,  "Nmm"), "Tz":    (5, True,  "Nmm"),
-        "Fnorm": (None, False, "N"), "Tnorm": (None, False, "Nmm"),
+        "Fnorm": (None, False, "N"), "Tnorm": (None, False, "Nmm"), "Fxy": (None, False, "N"),
     }
+    _UNSIGNED_LC_CHANNELS = ("Fnorm", "Tnorm", "Fxy")
 
     def _lc_value(self, sample, channel: str) -> float:
         if channel == "Fnorm":
             return _math.sqrt(sum(sample[i]**2 for i in range(3)))
+        if channel == "Fxy":
+            return _math.hypot(sample[0], sample[1])
         if channel == "Tnorm":
             return _math.sqrt(sum(sample[i]**2 for i in range(3, 6)))
         return sample[self._LC_CHANNELS[channel][0]]
@@ -5014,8 +6109,47 @@ class ExpGUI(tk.Tk):
     # ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â
     #  Close
     # ÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚ÂÃƒÂ¢Ã¢â‚¬Â¢Ã‚Â
+    def _rah_score_rule_text(self) -> str:
+        singular = themes.active()['noun'][0]
+        question = ('After every complete run you are asked whether to add it to the leaderboard; '
+                    'the recording and the run log are saved either way. '
+                    if RAH_LEADERBOARD_CONFIRM else '')
+        return (f'Optional ID; every complete run adds its {singular}s to your total (collected / possible). '
+                f'1 {singular} = 1 point; {int(round(STICKER_FRACTION * 100))} % or more of a run\'s {singular}s = 1 sticker. '
+                f'{question}The leaderboard shows on the subject display until the next start.')
+
+    def _on_rah_theme_selected(self, *_event):
+        """Switch the game theme (display only: scores, markers and triggers are unchanged)."""
+        title = self.rah_theme_var.get()
+        name = next((key for key, theme in themes.THEMES.items() if theme['title'] == title), None)
+        if name is None or name == themes.active_name():
+            return
+        if self._rah_mode_ref is not None or self._practice_mode_ref is not None or self._rah_countdown_active:
+            self.rah_theme_var.set(themes.active()['title'])
+            messagebox.showerror('RAH running', 'Stop the run or practice before changing the game theme.', parent=self)
+            return
+        themes.set_active(name)
+        self._rah_score_rule_lbl.config(text=self._rah_score_rule_text())
+        display = getattr(self, 'display', None)
+        if display is not None and display.winfo_exists():
+            display.on_theme_changed()
+
+    def _show_subject_display(self):
+        """Bring the subject display back after its window was closed (it is only withdrawn)."""
+        display = getattr(self, 'display', None)
+        if display is None or not display.winfo_exists():
+            self.display = DisplayWindow(self)
+            return
+        display.deiconify()
+        display.lift()
+
     def on_close(self):
         self._motion_polling = False
+        self._practice_polling = False
+        self._practice_mode_ref = None
+        self._mvc_emg_running = False
+        self._mvc_emg_cancel_timers()
+        mvc_rigfiles.save_settings(MVC_EMG_SETTINGS_PATH, {'tag': self.mvc_emg_tag_var.get().strip(), 'tmsi_dir': self.mvc_emg_tmsi_dir_var.get().strip()})
         self._cancel_manual_velocity_poll()
         self._cancel_manual_position_poll()
         try:
@@ -5028,6 +6162,10 @@ class ExpGUI(tk.Tk):
         except Exception:
             pass
         try:
+            # Leave the motor as every stop handler does: position mode, torque off, damper off.
+            self.serial_worker.send('ZERO_VEL')
+            self.serial_worker.send('MODE_EXT')
+            self.serial_worker.send('TORQUE_OFF')
             self.serial_worker.send('SET_DMP:0')
         except Exception:
             pass

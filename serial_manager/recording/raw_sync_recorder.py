@@ -80,9 +80,7 @@ class _AsyncCsvWriter:
 
     def write(self, row: dict):
         if not self._active:
-            with self._lock:
-                self._dropped_rows += 1
-            return
+            return  # a row arriving before start() or after stop() is not a drop of the recording
         self._queue.put(dict(row))
 
     def stop(self):
@@ -311,7 +309,8 @@ class RawSyncRecorder:
             "host_rx_rel_ns": self._delta_ns(host_rx_ns, experiment_t0_ns),
             "openrb_sequence": openrb_sequence,
             "openrb_motor_us": openrb_motor_us,
-            "openrb_motor_rel_us": int(openrb_motor_us - first_openrb_motor_us),
+            # The OpenRB clock is a uint32 micros() that wraps every 71.6 min: take the difference modulo 2^32.
+            "openrb_motor_rel_us": int((openrb_motor_us - first_openrb_motor_us) & 0xFFFFFFFF),
             "position_raw": position_raw,
             "velocity_raw": velocity_raw,
             "openrb_event_id": openrb_event_id,

@@ -38,8 +38,8 @@ class SerialWorker:
         self._last_full_sample = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
     def connect(self, port: str, on_success=None, on_error=None):
-        if self.connected:
-            return
+        if self.connected or (self.thread is not None and self.thread.is_alive()):
+            return  # connected, or a connect attempt is still in progress
         self.stop_evt.clear()
         self.ring.clear()
         self.thread = threading.Thread(
@@ -67,12 +67,21 @@ class SerialWorker:
         self.connected = True
         if on_success:
             on_success()
+        ser = self.ser
         rx_buffer = bytearray()
         while not self.stop_evt.is_set():
             try:
-                data = self.ser.read(self.ser.in_waiting or 1)
+                data = ser.read(ser.in_waiting or 1)
+            except serial.SerialException as exc:
+                # The port is gone (unplugged or closed): stop reading instead of spinning at
+                # full CPU while still reporting "connected".
+                if not self.stop_evt.is_set():
+                    print(f"[SerialWorker] read failed, disconnecting ({exc})", flush=True)
+                self.connected = False
+                break
             except Exception:
-                data = b""
+                time.sleep(0.005)
+                continue
             if not data:
                 continue
             rx_buffer.extend(data)

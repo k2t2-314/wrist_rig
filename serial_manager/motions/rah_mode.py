@@ -21,10 +21,25 @@ class RAHMode(ModeBase):
     parameters = [{'name': 'direction', 'default': 1, 'min': -1, 'max': 1, 'unit': '+1=extension / -1=flexion'}, {'name': 'mvc_value', 'default': 10.0, 'min': 0.1, 'max': 500.0, 'unit': 'N or Nm'}, {'name': 'total_reps', 'default': 3, 'min': 1, 'max': 50, 'unit': 'trials'}, {'name': 'profile_points', 'default': None, 'unit': 'optional absolute (time_s, %MVC) points'}, {'name': 'perturbation_events', 'default': None, 'unit': 'optional absolute perturbation events'}, {'name': 'hold_step_enabled', 'default': 0, 'min': 0, 'max': 1, 'unit': '0=off, 1=on'}]
 
     PERTURB_REACHED_TOL_DEG = 0.5
+    # A perturbation leg that has not reached its target by this time (3x the nominal travel
+    # time plus 0.5 s, at least 0.75 s) is abandoned so the wrist always returns to the hold.
+    PERTURB_LEG_TIMEOUT_MIN_S = 0.75
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Called as on_phase_change(prev_phase, new_phase) from compute(), i.e. on the motion
+        # thread at the 100 Hz tick that starts the new phase. The GUI uses it to emit the
+        # trigger and the CSV marker without waiting for its own 100 ms loop.
+        self.on_phase_change = None
+        self._profile_cache = (None, [])
+        self._events_cache = (None, [])
+        self.reset()
 
     def reset(self):
         super().reset()
         self.sub_phase = "idle"
+        self._phase_announced = False
+        self._perturb_deadline = None
         self._base_hold_pos = 0.0
         self._hold_pos = 0.0
         self._start_t = None
@@ -44,6 +59,8 @@ class RAHMode(ModeBase):
         self._base_hold_pos = wrist_deg
         self._hold_pos = wrist_deg
         self.sub_phase = "rest"
+        self._phase_announced = False
+        self._perturb_deadline = None
         self._start_t = None
         self._perturb_done_events = set()
         self._perturb_active = False
@@ -59,7 +76,11 @@ class RAHMode(ModeBase):
 
 
     def _custom_profile_points(self) -> list[tuple[float, float]]:
+        # Parsed once per profile list (compute() asks for the points several times per tick).
         raw = self.params.get("profile_points", None)
+        cached_raw, cached_points = getattr(self, "_profile_cache", (None, []))
+        if raw is not None and raw is cached_raw:
+            return cached_points
         if not isinstance(raw, (list, tuple)):
             return []
         points = []
@@ -69,7 +90,18 @@ class RAHMode(ModeBase):
                 points.append((float(time_s), float(pct)))
             except (TypeError, ValueError):
                 continue
-        return sorted(points, key=lambda item: item[0])
+        points = sorted(points, key=lambda item: item[0])
+        self._profile_cache = (raw, points)
+        return points
+
+    def _notify_phase(self, prev_phase, new_phase):
+        callback = self.on_phase_change
+        if callback is None:
+            return
+        try:
+            callback(prev_phase, new_phase)
+        except Exception as exc:
+            print(f"[RAHMode] on_phase_change error ({exc!r})", flush=True)
 
     def has_custom_profile(self) -> bool:
         return len(self._custom_profile_points()) >= 2
@@ -164,6 +196,9 @@ class RAHMode(ModeBase):
 
     def _custom_perturbation_events(self) -> list[tuple[float, float, float, float]]:
         raw = self.params.get("perturbation_events", None)
+        cached_raw, cached_events = getattr(self, "_events_cache", (None, []))
+        if raw is not None and raw is cached_raw:
+            return cached_events
         if not isinstance(raw, (list, tuple)):
             return []
         events = []
@@ -178,7 +213,9 @@ class RAHMode(ModeBase):
                 ))
             except (TypeError, ValueError):
                 continue
-        return sorted(events, key=lambda item: item[0])
+        events = sorted(events, key=lambda item: item[0])
+        self._events_cache = (raw, events)
+        return events
 
     def _target_step_pos(self, relative_direction: float, step_deg: float) -> float:
         step_deg = abs(float(step_deg))
@@ -198,6 +235,13 @@ class RAHMode(ModeBase):
         self._perturb_speed_deg_s = None
         self._perturb_target = None
         self._perturb_prev_gap = None
+        self._perturb_deadline = None
+
+    def _perturb_leg_deadline(self, elapsed: float) -> float:
+        step_deg = abs(float(self._perturb_step_deg or 0.0))
+        speed = abs(float(self._perturb_speed_deg_s or 0.0))
+        nominal = step_deg / speed if speed > 1e-9 else 0.0
+        return elapsed + max(self.PERTURB_LEG_TIMEOUT_MIN_S, 3.0 * nominal + 0.5)
 
     def _hold_command(self, velocity_override=None) -> Command:
         self._hold_pos = self._base_hold_pos
@@ -211,13 +255,16 @@ class RAHMode(ModeBase):
             self._start_t = now
         elapsed = max(0.0, now - self._start_t)
         (phase, rep, phase_t) = self.phase_at(elapsed)
-        self.sub_phase = phase
+        prev_phase = self.sub_phase
         self._rep = max(0, rep - 1)
+        if phase != prev_phase or not self._phase_announced:
+            # Announce before publishing sub_phase, so a reader that sees the new phase also
+            # sees the marker the listener set for it (no duplicate trigger from the GUI loop).
+            self._phase_announced = True
+            self._notify_phase(prev_phase if phase != prev_phase else None, phase)
+        self.sub_phase = phase
         step_enabled = bool(int(round(float(self.params.get('hold_step_enabled', 0) or 0))))
-        reps = max(1, int(round(float(self.params.get('total_reps', 3)))))
-        hold = max(0.0, float(self.params.get('hold_time_s', 10.0)))
         custom_events = self._custom_perturbation_events()
-        schedule = {}
         perturb_marker = None
         if phase == 'done':
             self._done = True
@@ -240,6 +287,7 @@ class RAHMode(ModeBase):
                 self._perturb_speed_deg_s = speed_deg_s
                 self._perturb_target = self._target_step_pos(relative_direction=relative_direction, step_deg=step_deg)
                 self._perturb_prev_gap = None
+                self._perturb_deadline = self._perturb_leg_deadline(elapsed)
                 perturb_marker = 5
                 break
         if not self._perturb_active:
@@ -254,11 +302,13 @@ class RAHMode(ModeBase):
             target = target_hold_pos if self._perturb_stage == 'out' else self._base_hold_pos
             gap = target - wrist
             crossed = self._perturb_prev_gap is not None and gap * self._perturb_prev_gap <= 0.0
-            reached = abs(gap) <= self.PERTURB_REACHED_TOL_DEG or crossed
+            timed_out = self._perturb_deadline is not None and elapsed >= self._perturb_deadline
+            reached = abs(gap) <= self.PERTURB_REACHED_TOL_DEG or crossed or timed_out
             if reached:
                 if self._perturb_stage == 'out':
                     self._perturb_stage = 'return'
                     self._perturb_prev_gap = None
+                    self._perturb_deadline = self._perturb_leg_deadline(elapsed)
                     continue
                 self._hold_pos = self._base_hold_pos
                 self._clear_perturbation(mark_done=True)

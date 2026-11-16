@@ -41,8 +41,8 @@ class LCWorker:
         self._last_record_host_rx_ns = None
 
     def connect(self, port: str = LC_COM_PORT, on_success=None, on_error=None):
-        if self.connected:
-            return
+        if self.connected or (self.thread is not None and self.thread.is_alive()):
+            return  # connected, or a connect attempt (with its 3 s of setup) is still in progress
         self.stop_evt.clear()
         self.ring.clear()
         self._offset = [0.0] * 6   # reset offset on every connect
@@ -87,11 +87,13 @@ class LCWorker:
                 vals = self._read_binary_resolved_record()
                 if vals is not None and vals[0] == 0:
                     bias_samples.append(vals)
-            if bias_samples:
-                self.bias = [
-                    sum(s[i] for s in bias_samples) / len(bias_samples)
-                    for i in range(7)
-                ]
+            if not bias_samples:
+                # Connecting with a stale (or zero) bias would silently offset every force value.
+                raise RuntimeError("no valid Nano17 records received while taring (check the LC port and power)")
+            self.bias = [
+                sum(s[i] for s in bias_samples) / len(bias_samples)
+                for i in range(7)
+            ]
             self.ser.timeout = orig
         except Exception as e:
             self.status = f"LC: Binary setup error ({e})"
@@ -178,9 +180,21 @@ class LCWorker:
 
     def _read_binary_resolved_record(self):
         while not self.stop_evt.is_set():
+            ser = self.ser
+            if ser is None:
+                return None
             try:
                 need = max(1, ATI_BINARY_RESOLVED_RECORD_BYTES - len(self._binary_rx))
-                chunk = self.ser.read(need)
+                chunk = ser.read(need)
+            except serial.SerialException as exc:
+                # The port is gone (unplugged or closed): end the read loop instead of spinning
+                # at full CPU while still reporting "connected".
+                if not self.stop_evt.is_set():
+                    self.status = f"LC: read failed ({exc})"
+                    print(f"[LCWorker] read failed, disconnecting ({exc})", flush=True)
+                self.connected = False
+                self.stop_evt.set()
+                return None
             except Exception:
                 return None
             if not chunk:
